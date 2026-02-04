@@ -19,42 +19,20 @@ listen port로 연결이 들어오면 connect 주소로 연결을 맺고 TLS han
 
 ```
 ssl-inspection-pseudocode/
-├── trunk/                    # 개발 버전 (최신)
-│   ├── main.c               # 메인 소스 (thread-pool, async mode 지원)
-│   ├── sslid-lib.c          # SSL inspection 라이브러리
-│   ├── aes.c                # AES 암/복호화 구현
-│   ├── aes-gcm.c            # AES-GCM 구현
-│   ├── sha256.c             # SHA256, HMAC-SHA256, PRF 구현
-│   ├── ghash.c              # GHASH 구현
-│   ├── test-vector.c        # 암호화 테스트 벡터
-│   ├── signal-handler.c     # 시그널 핸들러
-│   ├── include/             # 헤더 파일
-│   ├── misc/                # 참고 자료
-│   └── openssl-aes-gcm-test-vector/  # OpenSSL AES-GCM 테스트
-│
-└── tag/
-    └── 20240624/             # 2024년 6월 24일 릴리스 버전
-        ├── (소스 파일들)
-        ├── openssl-1.1.1w/   # OpenSSL 1.1.1w 소스 (번들)
-        ├── openssl-3.2.0/    # OpenSSL 3.2.0 소스 (TODO)
-        └── zlib-1.2.11/      # zlib 소스 (선택적)
+├── main.c               # 메인 소스 (thread-pool, async mode 지원)
+├── sslid-lib.c          # SSL inspection 라이브러리
+├── aes.c                # AES 암/복호화 구현
+├── aes-gcm.c            # AES-GCM 구현
+├── sha256.c             # SHA256, HMAC-SHA256, PRF 구현
+├── ghash.c              # GHASH 구현
+├── test-vector.c        # 암호화 테스트 벡터
+├── signal-handler.c     # 시그널 핸들러
+├── include/             # 헤더 파일
+├── misc/                # 참고 자료
+└── openssl-aes-gcm-test-vector/  # OpenSSL AES-GCM 테스트
 ```
 
-## 버전별 차이점
-
-| 기능 | trunk (개발) | tag/20240624 |
-|------|-------------|--------------|
-| Thread pool | O | X |
-| DPDK lcore 지원 | O | X |
-| Async mode | O | X |
-| TCP proxy (nossl) | O | X |
-| kTLS 지원 | X | O |
-| OpenSSL 번들 | X (시스템 사용) | O (1.1.1w 정적 링크) |
-| 최소 커널 버전 | - | 4.19 (kTLS RX) |
-
 ## 빌드 방법
-
-### trunk (개발 버전)
 
 ```bash
 cd trunk
@@ -65,16 +43,6 @@ make
 # DEF_ENABLE_DPDK_LCORE=<yes|no>        - DPDK lcore 맵핑 사용 유무
 # PKGCONF=<pkg-config>                  - pkg-config 명령 경로
 # CROSS_COMPILE=<toolchain prefix>      - 크로스 컴파일 (예: aarch64-marvell-linux-gnu-)
-```
-
-### tag/20240624 (릴리스 버전)
-
-```bash
-cd tag/20240624
-make           # OpenSSL 1.1.1w 자동 빌드 및 정적 링크
-make -j$(nproc)  # 병렬 빌드
-make clean     # 정리
-make distclean # OpenSSL 포함 전체 정리
 ```
 
 ## 실행 방법
@@ -112,7 +80,7 @@ make distclean # OpenSSL 포함 전체 정리
 -e, --engine=<name>         OpenSSL 엔진 지정
 ```
 
-### tag/20240624 전용 옵션 (kTLS)
+### 예전 tag/20240624 전용 옵션 (kTLS) deprecated
 
 ```
 --ktls                      kTLS 활성화 (커널 레벨 암/복호화)
@@ -127,7 +95,8 @@ make distclean # OpenSSL 포함 전체 정리
 
 ## 라이선스
 
-Copyright (C) MINZKN.COM - All rights reserved.
+- Copyright (C) MINZKN.COM - All rights reserved.
+- GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
 
 ## 저자
 
