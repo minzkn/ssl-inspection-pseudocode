@@ -282,8 +282,8 @@ void *hwport_encrypt_mode_cfb8(hwport_encrypt_handler_t s_handler, size_t s_bloc
     
     if(s_block_size > sizeof(s_iv_buffer_local)) {
         s_iv_buffer = malloc(s_block_size);
-        if(s_iv_buffer == ((void *)(NULL))) { /* ERROR : not enough memory ! */
-            return((void *)(NULL));
+        if(s_iv_buffer == ((void *)0)) { /* ERROR : not enough memory ! */
+            return((void *)0);
         }
     }
     else {
@@ -327,8 +327,8 @@ void *hwport_decrypt_mode_cfb8(hwport_encrypt_handler_t s_handler, size_t s_bloc
     
     if(s_block_size > sizeof(s_iv_buffer_local)) {
         s_iv_buffer = malloc(s_block_size);
-        if(s_iv_buffer == ((void *)(NULL))) { /* ERROR : not enough memory ! */
-            return((void *)(NULL));
+        if(s_iv_buffer == ((void *)0)) { /* ERROR : not enough memory ! */
+            return((void *)0);
         }
     }
     else {
@@ -486,8 +486,8 @@ void *hwport_decrypt_mode_cbc(hwport_encrypt_handler_t s_handler, size_t s_block
     }
     else {
         s_iv_uint8_ptr = (uint8_t *)malloc(s_block_size);
-        if(s_iv_uint8_ptr == ((uint8_t *)(NULL))) {
-            return((void *)(NULL));
+        if(s_iv_uint8_ptr == ((uint8_t *)0)) {
+            return((void *)0);
         }
     }
     for(s_offset = (size_t)0u;s_offset < s_size;s_offset += s_block_size) {

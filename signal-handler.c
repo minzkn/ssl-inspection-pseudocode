@@ -13,10 +13,6 @@
 
 #include <signal.h>
 
-#if defined(def_sslid_use_dpdk_lcore)
-# include <rte_lcore.h>
-#endif
-
 /* ---- */
 
 void SSL_inspection_break_main_loop(void);
@@ -29,7 +25,6 @@ int SSL_inspection_install_signal_handler(void);
 /* ---- */
 
 static volatile int g_SSL_inspection_break = 0;
-static volatile int g_SSL_inspection_critical = 0;
 
 /* ---- */
 
@@ -45,15 +40,10 @@ int SSL_inspection_is_break_main_loop(void)
 
 static void SSL_inspection_signal_handler(int s_signo)
 {
-#if defined(def_sslid_use_dpdk_lcore)
-	(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d) (lcore=%u)\n", __func__, s_signo, rte_lcore_id());
-#else
-	(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d)\n", __func__, s_signo);
-#endif
-
 	switch(s_signo) {
 		case SIGSEGV:
 		case SIGILL:
+		case SIGABRT:
 		case SIGFPE:
 #if defined(SIGBUS)
 		case SIGBUS:
@@ -67,11 +57,7 @@ static void SSL_inspection_signal_handler(int s_signo)
 #if defined(SIGSYS)
 		case SIGSYS:
 #endif
-		case SIGABRT:
-			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
-				_exit(128 | s_signo);
-			}
-			*((volatile int *)(&g_SSL_inspection_critical)) = 1;
+			(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d) => ERROR\n", __func__, s_signo);
 			SSL_inspection_dump_backtrace();
 			SSL_inspection_break_main_loop();
 			_exit(128 | s_signo);
@@ -79,13 +65,8 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGQUIT: /* 강제 종료 */
 		case SIGINT: /* Ctrl + C */
 		case SIGTERM:
-			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
-				_exit(128 | s_signo);
-			}
-			if((s_signo == SIGQUIT) || (SSL_inspection_is_break_main_loop() != 0)) {
-				if(s_signo == SIGABRT) {
-					*((volatile int *)(&g_SSL_inspection_critical)) = 1;
-				}
+			(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d) => TERMINATE\n", __func__, s_signo);
+			if(s_signo == SIGQUIT) {
 				SSL_inspection_dump_backtrace();
 			}
 			SSL_inspection_break_main_loop();
@@ -97,6 +78,7 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGPIPE: /* broken pipe ! */
 		default:
 			/* 단순 발생유무만 확인하는 부분 */
+			(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d) => INFO\n", __func__, s_signo);
 			SSL_inspection_dump_backtrace();
 			break;
 	}

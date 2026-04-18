@@ -11,8 +11,6 @@
 
 #include "sslid-lib.h"
 
-#if defined(def_sslid_test_vector)
-
 /* ---- */
 
 /* ---- */
@@ -54,7 +52,7 @@ int SSL_inspection_sha256_test0(int s_is_verbose)
 		strlen((const char *)(&cg_test_string[0]))
 	);
 
-	(void)SSL_inspection_fprintf(
+	(void)fprintf(
 		stdout,
 		"* TEST Digest SHA-256 push \"%s\" (%lu bytes, %s)\n",
 		(const char *)(&cg_test_string[0]),
@@ -74,7 +72,7 @@ int SSL_inspection_sha256_test0(int s_is_verbose)
 		(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 	}
 
-	(void)SSL_inspection_fprintf(
+	(void)fprintf(
 		stdout,
 		"* TEST Digest SHA-256 simple \"%s\" (%lu bytes, %s)\n",
 		(const char *)(&cg_test_string[0]),
@@ -129,7 +127,7 @@ int SSL_inspection_hmac_sha256_test0(int s_is_verbose)
 		strlen((const char *)(&cg_test_data[0]))
 	);
 
-	(void)SSL_inspection_fprintf(
+	(void)fprintf(
 		stdout,
 		"* TEST Digest HMAC-SHA-256 push (secret=\"%s\", data=\"%s\", %s)\n",
 		(const char *)(&cg_test_secret[0]),
@@ -150,39 +148,74 @@ int SSL_inspection_hmac_sha256_test0(int s_is_verbose)
 	}
 
 #if 1L /* Test by OpenSSL */
-	/* unsigned char *HMAC(const EVP_MD *evp_md, const void *key, int key_len, const unsigned char *data, size_t data_len, unsigned char *md, unsigned int *md_len); */
-	if(HMAC(
-		EVP_sha256(),
-		(const void *)(&cg_test_secret[0]),
-		(int)strlen((const char *)(&cg_test_secret[0])),
-		(const unsigned char *)(&cg_test_data[0]),
-		strlen((const char *)(&cg_test_data[0])),
-		(unsigned char *)memset((void *)(&s_digest_local[0]), 0, sizeof(s_digest_local)),
-		(unsigned int *)NULL
-	) == ((unsigned char *)(NULL))) {
-		(void)SSL_inspection_fprintf(
-			stdout,
-			"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC failed)\n"
-		);
-	}
-	else {
-		(void)SSL_inspection_fprintf(
-			stdout,
-			"* TEST Digest HMAC-SHA-256 push by OpenSSL (secret=\"%s\", data=\"%s\", %s)\n",
-			(const char *)(&cg_test_secret[0]),
-			(const char *)(&cg_test_data[0]),
-			(
-				memcmp(
-					(const void *)(&s_digest_local[0]),
-					(const void *)(&cg_digest_check[0]),
-					sizeof(cg_digest_check)) == 0
-			) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
-		);
+	do {
+		HMAC_CTX *s_hmac_ctx;
 
-		if(s_is_verbose >= 1) {
-			(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
+		s_hmac_ctx = HMAC_CTX_new();
+		if(s_hmac_ctx == ((HMAC_CTX *)0)) {
+			(void)fprintf(
+				stdout,
+				"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (s_hmac_ctx is NULL)\n"
+			);
 		}
-	}
+		else {
+			if(HMAC_Init_ex(
+				s_hmac_ctx,
+			       	(const void *)(&cg_test_secret[0]),
+				(int)strlen((const char *)(&cg_test_secret[0])),
+				EVP_sha256(), /* == EVP_get_digestbyname("sha256") */
+				(ENGINE *)NULL) <= 0) {
+				(void)fprintf(
+					stdout,
+					"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Init_ex failed)\n"
+				);
+			}
+			else {
+				if(HMAC_Update(
+					s_hmac_ctx,
+					(const unsigned char *)(&cg_test_data[0]),
+					strlen((const char *)(&cg_test_data[0]))
+					) <= 0) {
+					(void)fprintf(
+						stdout,
+						"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Update failed)\n"
+					);
+				}
+				else {
+					if(HMAC_Final(
+						s_hmac_ctx,
+						(unsigned char *)memset((void *)(&s_digest_local[0]), 0, sizeof(s_digest_local)),
+						(unsigned int *)NULL
+						) <= 0) {
+						(void)fprintf(
+							stdout,
+							"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Final failed)\n"
+						);
+					}
+					else {
+						(void)fprintf(
+							stdout,
+							"* TEST Digest HMAC-SHA-256 push by OpenSSL (secret=\"%s\", data=\"%s\", %s)\n",
+							(const char *)(&cg_test_secret[0]),
+							(const char *)(&cg_test_data[0]),
+							(
+								memcmp(
+									(const void *)(&s_digest_local[0]),
+									(const void *)(&cg_digest_check[0]),
+									sizeof(cg_digest_check)) == 0
+							) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
+						);
+
+						if(s_is_verbose >= 1) {
+							(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
+						}
+					}
+				}
+			}
+
+			HMAC_CTX_free(s_hmac_ctx);
+		}
+	}while(0);
 #endif
 
 	return(0);
@@ -208,11 +241,41 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 	hwport_sha256_t *s_sha256;
 	uint8_t s_digest_local[ def_hwport_sha256_digest_size ];
 
+#if 1L /* Test by OpenSSL */
+	HMAC_CTX *s_hmac_ctx;
+#endif
+
 	s_sha256 = hwport_init_hmac_sha256(
 		(hwport_sha256_t *)(&s_sha256_local),
 		(const void *)(&cg_test_secret[0]),
 		strlen((const char *)(&cg_test_secret[0]))
 	);
+
+#if 1L /* Test by OpenSSL */
+	s_hmac_ctx = HMAC_CTX_new();
+	if(s_hmac_ctx == ((HMAC_CTX *)0)) {
+		(void)fprintf(
+			stdout,
+			"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (s_hmac_ctx is NULL)\n"
+		);
+	}
+	else {
+		if(HMAC_Init_ex(
+			s_hmac_ctx,
+			(const void *)(&cg_test_secret[0]),
+			(int)strlen((const char *)(&cg_test_secret[0])),
+			EVP_sha256(), /* == EVP_get_digestbyname("sha256") */
+			(ENGINE *)NULL) <= 0) {
+			(void)fprintf(
+				stdout,
+				"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Init_ex failed)\n"
+			);
+
+			HMAC_CTX_free(s_hmac_ctx);
+			s_hmac_ctx = (HMAC_CTX *)NULL;
+		}
+	}
+#endif
 
 #if 0L
 	(void)hwport_sha256_push(
@@ -222,13 +285,13 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 	);
 
 #if 1L /* Test by OpenSSL */
-	if(s_hmac_ctx != ((HMAC_CTX *)(NULL))) {
+	if(s_hmac_ctx != ((HMAC_CTX *)0)) {
 		if(HMAC_Update(
 			s_hmac_ctx,
 			(const unsigned char *)(&cg_test_data[0]),
 			strlen((const char *)(&cg_test_data[0]))
 			) <= 0) {
-			(void)SSL_inspection_fprintf(
+			(void)fprintf(
 				stdout,
 				"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Update failed)\n"
 			);
@@ -245,7 +308,7 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 		size_t s_unit_size;
 		size_t s_rand_size;
 
-		srand((unsigned int)time((time_t *)(NULL)));
+		srand((unsigned int)time((time_t *)0));
 		s_data_size = strlen((const char *)(&cg_test_data[0]));
 		for(s_offset = (size_t)0u;s_offset < s_data_size;) {
 			s_rand_size = ((size_t)(rand() % 10)) /* + ((size_t)1u) */;
@@ -260,14 +323,32 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 				s_unit_size
 			);
 			
+#if 1L /* Test by OpenSSL */
+			if(s_hmac_ctx != ((HMAC_CTX *)0)) {
+				if(HMAC_Update(
+					s_hmac_ctx,
+					(const unsigned char *)(&cg_test_data[s_offset]),
+					s_unit_size
+					) <= 0) {
+					(void)fprintf(
+						stdout,
+						"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Update failed)\n"
+					);
+
+					HMAC_CTX_free(s_hmac_ctx);
+					s_hmac_ctx = (HMAC_CTX *)NULL;
+				}
+			}
+#endif
+
 			s_offset += s_unit_size;
 			
-			(void)SSL_inspection_fprintf(stdout, "partial push %lu/%lu/%lu\n", s_unit_size, s_offset, s_data_size);
+			(void)fprintf(stdout, "partial push %lu/%lu/%lu\n", s_unit_size, s_offset, s_data_size);
 		}
 	}while(0);
 #endif
 
-	(void)SSL_inspection_fprintf(
+	(void)fprintf(
 		stdout,
 		"* TEST Digest HMAC-SHA-256 push (secret=\"%s\", data=\"%s\", %s)\n",
 		(const char *)(&cg_test_secret[0]),
@@ -288,37 +369,34 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 	}
 			
 #if 1L /* Test by OpenSSL */
-	/* unsigned char *HMAC(const EVP_MD *evp_md, const void *key, int key_len, const unsigned char *data, size_t data_len, unsigned char *md, unsigned int *md_len); */
-	if(HMAC(
-		EVP_sha256(),
-		(const void *)(&cg_test_secret[0]),
-		(int)strlen((const char *)(&cg_test_secret[0])),
-		(const unsigned char *)(&cg_test_data[0]),
-		strlen((const char *)(&cg_test_data[0])),
-		(unsigned char *)memset((void *)(&s_digest_local[0]), 0, sizeof(s_digest_local)),
-		(unsigned int *)NULL
-	) == ((unsigned char *)(NULL))) {
-		(void)SSL_inspection_fprintf(
-			stdout,
-			"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC failed)\n"
-		);
-	}
-	else {
-		(void)SSL_inspection_fprintf(
-			stdout,
-			"* TEST Digest HMAC-SHA-256 push by OpenSSL (secret=\"%s\", data=\"%s\", %s)\n",
-			(const char *)(&cg_test_secret[0]),
-			(const char *)(&cg_test_data[0]),
-			(
-				memcmp(
-					(const void *)(&s_digest_local[0]),
-					(const void *)(&cg_digest_check[0]),
-					sizeof(cg_digest_check)) == 0
-			) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
-		);
+	if(s_hmac_ctx != ((HMAC_CTX *)0)) {
+		if(HMAC_Final(
+			s_hmac_ctx,
+			(unsigned char *)memset((void *)(&s_digest_local[0]), 0, sizeof(s_digest_local)),
+			(unsigned int *)NULL
+			) <= 0) {
+			(void)fprintf(
+				stdout,
+				"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Final failed)\n"
+			);
+		}
+		else {
+			(void)fprintf(
+				stdout,
+				"* TEST Digest HMAC-SHA-256 push by OpenSSL (secret=\"%s\", data=\"%s\", %s)\n",
+				(const char *)(&cg_test_secret[0]),
+				(const char *)(&cg_test_data[0]),
+				(
+					memcmp(
+						(const void *)(&s_digest_local[0]),
+						(const void *)(&cg_digest_check[0]),
+						sizeof(cg_digest_check)) == 0
+				) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
+			);
 
-		if(s_is_verbose >= 1) {
-			(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
+			if(s_is_verbose >= 1) {
+				(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
+			}
 		}
 	}
 #endif
@@ -397,8 +475,8 @@ int SSL_inspection_pseudo_random_function_tlsv1_2_sha256_test0(int s_is_verbose)
 		(void *)(&s_output[0]),
 		sizeof(s_output)
 	);
-
-	(void)SSL_inspection_fprintf(
+	
+	(void)fprintf(
 		stdout,
 		"* TEST TLS v1.2 PRF[Psudo Random Function] (label=\"%s\", %lu bytes, %s)\n",
 		(const char *)(&cg_label[0]),
@@ -520,8 +598,8 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 	const EVP_CIPHER *c_cipher;
 
 	ssize_t s_process_size;
-
-	(void)SSL_inspection_fprintf(stdout, "* TEST AEAD-AES128-GCM\n");
+	
+	(void)fprintf(stdout, "* TEST AEAD-AES128-GCM\n");
 
 #if 1L
 	c_cipher = EVP_get_cipherbyname("aes-128-gcm");
@@ -530,21 +608,21 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 #endif
 
 	if(s_is_verbose >= 1) {
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_key0[0]), sizeof(cg_key0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_plaintext0[0]), sizeof(cg_plaintext0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Additional-Authenticated-Data (%lu bytes)\n", (unsigned long)sizeof(cg_aad0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Additional-Authenticated-Data (%lu bytes)\n", (unsigned long)sizeof(cg_aad0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_aad0[0]), sizeof(cg_aad0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Initial-Vector (%lu bytes)\n", (unsigned long)sizeof(cg_iv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Initial-Vector (%lu bytes)\n", (unsigned long)sizeof(cg_iv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_iv0[0]), sizeof(cg_iv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Integrity-Check-Value (%lu bytes)\n", (unsigned long)sizeof(cg_icv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Integrity-Check-Value (%lu bytes)\n", (unsigned long)sizeof(cg_icv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_icv0[0]), sizeof(cg_icv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Cipher-Text-Combines (%lu bytes)\n", (unsigned long)sizeof(cg_ciphertext_combines0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Cipher-Text-Combines (%lu bytes)\n", (unsigned long)sizeof(cg_ciphertext_combines0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_ciphertext_combines0[0]), sizeof(cg_ciphertext_combines0));
 	}
 
-	(void)SSL_inspection_fprintf(stdout, "  - Encrypt\n");
+	(void)fprintf(stdout, "  - Encrypt\n");
 	s_process_size = SSL_inspection_encrypt_AES_GCM(
 		c_cipher,
 		(const void *)(&cg_plaintext0[0]),
@@ -558,16 +636,16 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 		(void *)(&s_tag0[0])
 	);
 	if(s_process_size == ((ssize_t)(-1))) {
-		(void)SSL_inspection_fprintf(stderr, def_hwport_color_red "SSL_inspection_encrypt_AES_GCM failed !" def_hwport_color_normal "\n");
+		(void)fprintf(stderr, def_hwport_color_red "SSL_inspection_encrypt_AES_GCM failed !" def_hwport_color_normal "\n");
 	}
 	else {
-		(void)SSL_inspection_fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
+		(void)fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
 		if(s_is_verbose >= 1) {
 			(void)SSL_inspection_hexdump("      [A] ", (const void *)(&cg_aad0[0]), sizeof(cg_aad0));
 			(void)SSL_inspection_hexdump("      [E] ", (const void *)(&s_ciphertext0[0]), (size_t)s_process_size);
 			(void)SSL_inspection_hexdump("      [T] ", (const void *)(&s_tag0[0]), sizeof(s_tag0));
 		}
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify cipher-text : %s\n",
 			(memcmp(
@@ -575,7 +653,7 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 				(const void *)(&cg_ciphertext_combines0[sizeof(cg_aad0)]),
 				sizeof(cg_plaintext0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify tag : %s\n",
 			(memcmp(
@@ -584,7 +662,7 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 				sizeof(cg_icv0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
 
-		(void)SSL_inspection_fprintf(stdout, "  - Decrypt\n");
+		(void)fprintf(stdout, "  - Decrypt\n");
 		s_process_size = SSL_inspection_decrypt_AES_GCM(
 			c_cipher,
 			(const void *)(&s_ciphertext0[0]),
@@ -598,14 +676,14 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 			(void *)(&s_plaintext0[0])
 		);
 		if(s_process_size == ((ssize_t)(-1))) {
-			(void)SSL_inspection_fprintf(stderr, def_hwport_color_red "SSL_inspection_decrypt_AES_GCM failed !" def_hwport_color_normal "\n");
+			(void)fprintf(stderr, def_hwport_color_red "SSL_inspection_decrypt_AES_GCM failed !" def_hwport_color_normal "\n");
 		}
 		else {
-			(void)SSL_inspection_fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
+			(void)fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
 			if(s_is_verbose >= 1) {
 				(void)SSL_inspection_hexdump("      [D] ", (const void *)(&s_plaintext0[0]), (size_t)s_process_size);
 			}
-			(void)SSL_inspection_fprintf(
+			(void)fprintf(
 				stdout,
 				"    - verify cipher-text : %s\n",
 				(memcmp(
@@ -671,8 +749,8 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 	const EVP_CIPHER *c_cipher;
 
 	ssize_t s_process_size;
-
-	(void)SSL_inspection_fprintf(stdout, "* TEST TLSv1.2 record (Cipher-suite is AES128-GCM-SHA256)\n");
+	
+	(void)fprintf(stdout, "* TEST TLSv1.2 record (Cipher-suite is AES128-GCM-SHA256)\n");
 
 #if 1L
 	c_cipher = EVP_get_cipherbyname("aes-128-gcm");
@@ -697,29 +775,29 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 	s_aad0[9] = (unsigned char)0x03;
 	s_aad0[10] = (unsigned char)0x03;
 	/* record-length */
-	s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);
-	s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));
+	s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);;
+	s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));;
 
 	if(s_is_verbose >= 1) {
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_key0[0]), sizeof(cg_key0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_plaintext0[0]), sizeof(cg_plaintext0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Additional-Authenticated-Data (%lu bytes)\n", (unsigned long)sizeof(s_aad0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Additional-Authenticated-Data (%lu bytes)\n", (unsigned long)sizeof(s_aad0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&s_aad0[0]), sizeof(s_aad0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Salt (%lu bytes)\n", (unsigned long)sizeof(cg_salt0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Salt (%lu bytes)\n", (unsigned long)sizeof(cg_salt0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_salt0[0]), sizeof(cg_salt0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Initial-Vector (%lu bytes)\n", (unsigned long)sizeof(cg_iv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Initial-Vector (%lu bytes)\n", (unsigned long)sizeof(cg_iv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_iv0[0]), sizeof(cg_iv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Salt+IV (%lu bytes)\n", (unsigned long)sizeof(s_salt_iv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Salt+IV (%lu bytes)\n", (unsigned long)sizeof(s_salt_iv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&s_salt_iv0[0]), sizeof(s_salt_iv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Integrity-Check-Value (%lu bytes)\n", (unsigned long)sizeof(cg_icv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Integrity-Check-Value (%lu bytes)\n", (unsigned long)sizeof(cg_icv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_icv0[0]), sizeof(cg_icv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Cipher-Text-Combines (%lu bytes)\n", (unsigned long)sizeof(cg_ciphertext_combines0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Cipher-Text-Combines (%lu bytes)\n", (unsigned long)sizeof(cg_ciphertext_combines0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_ciphertext_combines0[0]), sizeof(cg_ciphertext_combines0));
 	}
 
-	(void)SSL_inspection_fprintf(stdout, "  - Encrypt\n");
+	(void)fprintf(stdout, "  - Encrypt\n");
 	s_process_size = SSL_inspection_encrypt_AES_GCM(
 		c_cipher,
 		(const void *)(&cg_plaintext0[0]),
@@ -733,14 +811,14 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 		(void *)(&s_tag0[0])
 	);
 	if(s_process_size == ((ssize_t)(-1))) {
-		(void)SSL_inspection_fprintf(stderr, def_hwport_color_red "SSL_inspection_encrypt_AES_GCM failed !" def_hwport_color_normal "\n");
+		(void)fprintf(stderr, def_hwport_color_red "SSL_inspection_encrypt_AES_GCM failed !" def_hwport_color_normal "\n");
 	}
 	else {
-		(void)SSL_inspection_fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
+		(void)fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
 
 		/* TLS record length update */
-		s_aad0[11] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) >> 8);
-		s_aad0[12] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) & ((size_t)0xffu));
+		s_aad0[11] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) >> 8);;
+		s_aad0[12] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) & ((size_t)0xffu));;
 
 		if(s_is_verbose >= 1) {
 			(void)SSL_inspection_hexdump("      [H] ", (const void *)(&s_aad0[0]), sizeof(s_aad0));
@@ -748,7 +826,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 			(void)SSL_inspection_hexdump("      [E] ", (const void *)(&s_ciphertext0[0]), (size_t)s_process_size);
 			(void)SSL_inspection_hexdump("      [T] ", (const void *)(&s_tag0[0]), sizeof(s_tag0));
 		}
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify TLS header : %s\n",
 			(memcmp(
@@ -756,7 +834,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 				(const void *)(&cg_ciphertext_combines0[0]),
 				sizeof(s_aad0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify cipher-text : %s\n",
 			(memcmp(
@@ -764,7 +842,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 				(const void *)(&cg_ciphertext_combines0[sizeof(s_aad0)]),
 				sizeof(cg_plaintext0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify tag : %s\n",
 			(memcmp(
@@ -773,9 +851,9 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 				sizeof(cg_icv0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
 
-		(void)SSL_inspection_fprintf(stdout, "  - Decrypt\n");
-		s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);
-		s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));
+		(void)fprintf(stdout, "  - Decrypt\n");
+		s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);;
+		s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));;
 		s_process_size = SSL_inspection_decrypt_AES_GCM(
 			c_cipher,
 			(const void *)(&s_ciphertext0[0]),
@@ -789,14 +867,14 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 			(void *)(&s_plaintext0[0])
 		);
 		if(s_process_size == ((ssize_t)(-1))) {
-			(void)SSL_inspection_fprintf(stderr, def_hwport_color_red "SSL_inspection_decrypt_AES_GCM failed !" def_hwport_color_normal "\n");
+			(void)fprintf(stderr, def_hwport_color_red "SSL_inspection_decrypt_AES_GCM failed !" def_hwport_color_normal "\n");
 		}
 		else {
-			(void)SSL_inspection_fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
+			(void)fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
 			if(s_is_verbose >= 1) {
 				(void)SSL_inspection_hexdump("      [D] ", (const void *)(&s_plaintext0[0]), (size_t)s_process_size);
 			}
-			(void)SSL_inspection_fprintf(
+			(void)fprintf(
 				stdout,
 				"    - verify cipher-text : %s\n",
 				(memcmp(
@@ -860,8 +938,8 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 	unsigned char s_plaintext0[ sizeof(cg_plaintext0) ] = {0, };
 
 	ssize_t s_process_size;
-
-	(void)SSL_inspection_fprintf(stdout, "* TEST TLSv1.2 record (Cipher-suite is AES128-GCM-SHA256) => Using internal impl.\n");
+	
+	(void)fprintf(stdout, "* TEST TLSv1.2 record (Cipher-suite is AES128-GCM-SHA256) => Using internal impl.\n");
 
 	(void)memcpy((void *)(&s_salt_iv0[0]), (const void *)(&cg_salt0[0]), sizeof(cg_salt0));
 	(void)memcpy((void *)(&s_salt_iv0[sizeof(cg_salt0)]), (const void *)(&cg_iv0[0]), sizeof(cg_iv0));
@@ -880,29 +958,29 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 	s_aad0[9] = (unsigned char)0x03;
 	s_aad0[10] = (unsigned char)0x03;
 	/* record-length */
-	s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);
-	s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));
+	s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);;
+	s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));;
 
 	if(s_is_verbose >= 1) {
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_key0[0]), sizeof(cg_key0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_plaintext0[0]), sizeof(cg_plaintext0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Additional-Authenticated-Data (%lu bytes)\n", (unsigned long)sizeof(s_aad0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Additional-Authenticated-Data (%lu bytes)\n", (unsigned long)sizeof(s_aad0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&s_aad0[0]), sizeof(s_aad0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Salt (%lu bytes)\n", (unsigned long)sizeof(cg_salt0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Salt (%lu bytes)\n", (unsigned long)sizeof(cg_salt0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_salt0[0]), sizeof(cg_salt0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Initial-Vector (%lu bytes)\n", (unsigned long)sizeof(cg_iv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Initial-Vector (%lu bytes)\n", (unsigned long)sizeof(cg_iv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_iv0[0]), sizeof(cg_iv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Salt+IV (%lu bytes)\n", (unsigned long)sizeof(s_salt_iv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Salt+IV (%lu bytes)\n", (unsigned long)sizeof(s_salt_iv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&s_salt_iv0[0]), sizeof(s_salt_iv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Integrity-Check-Value (%lu bytes)\n", (unsigned long)sizeof(cg_icv0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Integrity-Check-Value (%lu bytes)\n", (unsigned long)sizeof(cg_icv0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_icv0[0]), sizeof(cg_icv0));
-		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Cipher-Text-Combines (%lu bytes)\n", (unsigned long)sizeof(cg_ciphertext_combines0));
+		(void)fprintf(stdout, "  - TEST-VECTOR:Cipher-Text-Combines (%lu bytes)\n", (unsigned long)sizeof(cg_ciphertext_combines0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_ciphertext_combines0[0]), sizeof(cg_ciphertext_combines0));
 	}
 
-	(void)SSL_inspection_fprintf(stdout, "  - Encrypt\n");
+	(void)fprintf(stdout, "  - Encrypt\n");
 	s_process_size = (ssize_t)aes_gcm_ae(
 		(const uint8_t *)(&cg_key0[0]),
 		sizeof(cg_key0),
@@ -916,16 +994,16 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 		(uint8_t *)(&s_tag0[0])
 	);
 	if(s_process_size == ((ssize_t)(-1))) {
-		(void)SSL_inspection_fprintf(stderr, def_hwport_color_red "SSL_inspection_encrypt_AES_GCM failed !" def_hwport_color_normal "\n");
+		(void)fprintf(stderr, def_hwport_color_red "SSL_inspection_encrypt_AES_GCM failed !" def_hwport_color_normal "\n");
 	}
 	else {
 		s_process_size = (ssize_t)sizeof(cg_plaintext0);
 
-		(void)SSL_inspection_fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
+		(void)fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
 
 		/* TLS record length update */
-		s_aad0[11] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) >> 8);
-		s_aad0[12] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) & ((size_t)0xffu));
+		s_aad0[11] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) >> 8);;
+		s_aad0[12] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) & ((size_t)0xffu));;
 
 		if(s_is_verbose >= 1) {
 			(void)SSL_inspection_hexdump("      [H] ", (const void *)(&s_aad0[0]), sizeof(s_aad0));
@@ -933,7 +1011,7 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 			(void)SSL_inspection_hexdump("      [E] ", (const void *)(&s_ciphertext0[0]), (size_t)s_process_size);
 			(void)SSL_inspection_hexdump("      [T] ", (const void *)(&s_tag0[0]), sizeof(s_tag0));
 		}
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify TLS header : %s\n",
 			(memcmp(
@@ -941,7 +1019,7 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 				(const void *)(&cg_ciphertext_combines0[0]),
 				sizeof(s_aad0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify cipher-text : %s\n",
 			(memcmp(
@@ -949,7 +1027,7 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 				(const void *)(&cg_ciphertext_combines0[sizeof(s_aad0)]),
 				sizeof(cg_plaintext0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
-		(void)SSL_inspection_fprintf(
+		(void)fprintf(
 			stdout,
 			"    - verify tag : %s\n",
 			(memcmp(
@@ -958,9 +1036,9 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 				sizeof(cg_icv0)) == 0) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
 
-		(void)SSL_inspection_fprintf(stdout, "  - Decrypt\n");
-		s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);
-		s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));
+		(void)fprintf(stdout, "  - Decrypt\n");
+		s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);;
+		s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));;
 		s_process_size = (ssize_t)aes_gcm_ad(
 			(const uint8_t *)(&cg_key0[0]),
 			sizeof(cg_key0),
@@ -974,16 +1052,16 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 			(uint8_t *)(&s_plaintext0[0])
 		);
 		if(s_process_size == ((ssize_t)(-1))) {
-			(void)SSL_inspection_fprintf(stderr, def_hwport_color_red "SSL_inspection_decrypt_AES_GCM failed !" def_hwport_color_normal "\n");
+			(void)fprintf(stderr, def_hwport_color_red "SSL_inspection_decrypt_AES_GCM failed !" def_hwport_color_normal "\n");
 		}
 		else {
 			s_process_size = (ssize_t)sizeof(s_ciphertext0);
 
-			(void)SSL_inspection_fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
+			(void)fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
 			if(s_is_verbose >= 1) {
 				(void)SSL_inspection_hexdump("      [D] ", (const void *)(&s_plaintext0[0]), (size_t)s_process_size);
 			}
-			(void)SSL_inspection_fprintf(
+			(void)fprintf(
 				stdout,
 				"    - verify cipher-text : %s\n",
 				(memcmp(
@@ -996,8 +1074,6 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 
 	return(0);
 }
-
-#endif
 
 /* ---- */
 

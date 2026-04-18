@@ -11,19 +11,121 @@
 
 #include <sys/syscall.h>
 
+#if 0L
+# define def_SSL_inspection_recv_flags 0
+# define def_SSL_inspection_send_flags 0
+#else
+# define def_SSL_inspection_recv_flags MSG_NOSIGNAL
+# define def_SSL_inspection_send_flags MSG_NOSIGNAL
+#endif
+
+/* in OpenSSL source "crypto/evp/e_aes.c" - 각 OpenSSL 버젼마다 다를 수 있는 부분 */
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+# ifdef  TABLE_BITS /* Even though permitted values for TABLE_BITS are 8, 4 and 1, it should never be set to 8 [or 1]. For further information see gcm128.c.*/
+#  undef  TABLE_BITS
+# endif
+# define TABLE_BITS 4
+# define u64 uint64_t
+# define u32 uint32_t
+# define u8 uint8_t
+typedef struct {
+	u64 hi, lo;
+} u128;
+typedef struct {
+    /* Following 6 names follow names in GCM specification */
+    union {
+        u64 u[2];
+        u32 d[4];
+        u8 c[16];
+        size_t t[16 / sizeof(size_t)];
+    } Yi, EKi, EK0, len, Xi, H;
+    /*
+     * Relative position of Xi, H and pre-computed Htable is used in some
+     * assembler modules, i.e. don't change the order!
+     */
+#if TABLE_BITS==8
+    u128 Htable[256];
+#else
+    u128 Htable[16];
+    void (*gmult) (u64 Xi[2], const u128 Htable[16]);
+    void (*ghash) (u64 Xi[2], const u128 Htable[16], const u8 *inp,
+                   size_t len);
+#endif
+    unsigned int mres, ares;
+    block128_f block;
+    void *key;
+#if !defined(OPENSSL_SMALL_FOOTPRINT)
+    unsigned char Xn[48];
+#endif
+}gcm128_context_alias;
+typedef struct {
+    union {
+        double align;
+        AES_KEY ks;
+    } ks;                       /* AES key schedule to use */
+    int key_set;                /* Set if key initialised */
+    int iv_set;                 /* Set if an iv is set */
+    gcm128_context_alias gcm;
+    unsigned char *iv;          /* Temporary IV store */
+    int ivlen;                  /* IV length */
+    int taglen;
+    int iv_gen;                 /* It is OK to generate IVs */
+    int tls_aad_len;            /* TLS AAD length */
+    ctr128_f ctr;
+} EVP_AES_GCM_CTX;
+#else
+# ifdef  TABLE_BITS /* Even though permitted values for TABLE_BITS are 8, 4 and 1, it should never be set to 8 [or 1]. For further information see gcm128.c.*/
+#  undef  TABLE_BITS
+# endif
+# define TABLE_BITS 4
+# define u64 uint64_t
+# define u32 uint32_t
+# define u8 uint8_t
+typedef struct {
+	u64 hi, lo;
+} u128;
+typedef struct {
+    /* Following 6 names follow names in GCM specification */
+    union {
+        u64 u[2];
+        u32 d[4];
+        u8 c[16];
+        size_t t[16 / sizeof(size_t)];
+    } Yi, EKi, EK0, len, Xi, H;
+    /*
+     * Relative position of Xi, H and pre-computed Htable is used in some
+     * assembler modules, i.e. don't change the order!
+     */
+#if TABLE_BITS==8
+    u128 Htable[256];
+#else
+    u128 Htable[16];
+    void (*gmult) (u64 Xi[2], const u128 Htable[16]);
+    void (*ghash) (u64 Xi[2], const u128 Htable[16], const u8 *inp,
+                   size_t len);
+#endif
+    unsigned int mres, ares;
+    block128_f block;
+    void *key;
+}gcm128_context_alias;
+typedef struct {
+	union {
+		double align;
+		AES_KEY ks;
+	} ks;                       /* AES key schedule to use */
+	int key_set;                /* Set if key initialised */
+	int iv_set;                 /* Set if an iv is set */
+	gcm128_context_alias gcm;
+	unsigned char *iv;          /* Temporary IV store */
+	int ivlen;                  /* IV length */
+	int taglen;
+	int iv_gen;                 /* It is OK to generate IVs */
+	int tls_aad_len;            /* TLS AAD length */
+	ctr128_f ctr;
+}EVP_AES_GCM_CTX;
+#endif
+
 #include <execinfo.h>
-
-/* Secure memory clearing function - immune to compiler optimization */
-void SSL_inspection_secure_memzero(void *ptr, size_t size);
-
-int SSL_inspection_ratelimited_message_check(void);
-void SSL_inspection_perror(const char *s_prefix_message);
-int SSL_inspection_fprintf(FILE *s_stream, const char *s_format, ...) SSL_inspection_vsprintf_varg_check(2,3);
-
-char *SSL_inspection_cpuset_to_string(char *s_string, size_t s_limit_size, cpu_set_t *s_cpuset);
-
-unsigned long long SSL_inspection_get_time_stamp_msec(void);
-int SSL_inspection_msleep(int s_timeout_msec);
 
 void *SSL_inspection_increment_be_block(void *s_bigint_ptr, size_t s_size);
 void *SSL_inspection_xor_block(void *s_to_ptr, const void *s_from_ptr, size_t s_size);
@@ -37,24 +139,13 @@ void SSL_inspection_dump_backtrace(void);
 
 int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s_port, void *s_sockaddr_ptr, socklen_t *s_socklen_ptr);
 
-int SSL_inspection_set_keepalive_socket(int s_socket, int s_is_enable, int s_keepidle_sec, int s_keepintvl_sec);
-int SSL_inspection_set_linger_socket(int s_socket, int s_is_enable, int s_sec);
-int SSL_inspection_set_reuse_address_socket(int s_socket, int s_is_enable);
-int SSL_inspection_set_reuse_port_socket(int s_socket, int s_is_enable);
+int SSL_inspection_set_reuse_socket(int s_socket, int s_is_enable);
 int SSL_inspection_set_naggle_socket(int s_socket, int s_is_enable);
-int SSL_inspection_set_transparent_socket(int s_socket, int s_is_enable);
-int SSL_inspection_set_freebind_socket(int s_socket, int s_is_enable);
 int SSL_inspection_set_tx_socket_buffer_size(int s_socket, size_t s_size);
 int SSL_inspection_set_rx_socket_buffer_size(int s_socket, size_t s_size);
 
 int SSL_inspection_is_readable(int s_socket, int s_timeout_msec);
 int SSL_inspection_is_writable(int s_socket, int s_timeout_msec);
-void SSL_inspection_wait_for_async(SSL *s_ssl);
-
-int SSL_inspection_shutdown(SSL *s_ssl);
-
-int SSL_inspection_closefd(int s_fd);
-int SSL_inspection_closesocket(int s_socket);
 
 ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec);
 ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t s_size, int s_timeout_msec);
@@ -62,177 +153,29 @@ ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t
 ssize_t SSL_inspection_recv_fill(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec);
 ssize_t SSL_inspection_send_fill(SSL *s_ssl, int s_socket, const void *s_data, size_t s_size, int s_timeout_msec);
 
-SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_timeout_msec, int s_is_accept);
-int SSL_inspection_connect(int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec);
+static SSL *__SSL_inspection_ssl_connect(SSL_CTX *s_ssl_ctx, int s_socket, int s_timeout_msec);
+int SSL_inspection_connect(SSL_CTX *s_ssl_ctx, SSL **s_ssl_ptr /* OUT */, int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec);
+int SSL_inspection_simple_connect(SSL_CTX *s_ssl_ctx, SSL **s_ssl_ptr /* OUT */, const char *s_address, int s_port, int s_timeout_msec);
 
 ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_plaintext, size_t s_plaintext_size, const void *s_aad, size_t s_aad_size, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_ciphertext, void *s_tag);
 ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_ciphertext, size_t s_ciphertext_size, const void *s_aad, size_t s_aad_size, const void *s_tag, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_plaintext);
 
-/*
- * Secure memory clearing function - immune to compiler optimization
- * Uses OPENSSL_cleanse if available, otherwise explicit_bzero or manual volatile write
- */
-void SSL_inspection_secure_memzero(void *ptr, size_t size)
-{
-	if (ptr == NULL || size == 0) {
-		return;
-	}
+int SSL_inspection_dump_crypto_info(const char *s_title, const void *s_crypto_info_ptr);
 
-#if defined(OPENSSL_cleanse)
-	/* Prefer OpenSSL's cleanse function if available */
-	OPENSSL_cleanse(ptr, size);
-#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
-	/* Use explicit_bzero on glibc >= 2.25 */
-	explicit_bzero(ptr, size);
-#elif defined(_WIN32)
-	SecureZeroMemory(ptr, size);
-#else
-	/* Fallback: volatile pointer prevents optimization */
-	volatile unsigned char *volatile p = (volatile unsigned char *volatile)ptr;
-	while (size--) {
-		*p++ = 0;
-	}
-	/* Memory barrier to ensure the writes are not reordered */
-	__asm__ __volatile__("" : : "r"(ptr) : "memory");
-#endif
-}
+int SSL_inspection_set_ulp(int s_socket, const void *s_name, size_t s_name_size);
+int SSL_inspection_set_ulp_tls(int s_socket);
+void *SSL_inspection_get_crypto_info(int s_socket, int s_is_encrypt, size_t *s_size_ptr);
+int SSL_inspection_set_crypto_info(int s_socket, int s_is_encrypt, const void *s_crypto_info_ptr, size_t s_crypto_info_size);
 
-int SSL_inspection_ratelimited_message_check(void)
-{
-	static unsigned long long sg_consume_per_sec = 512ull; /* CONFIG */
+void *SSL_inspection_build_crypto_info(SSL *s_ssl, int s_is_encrypt, size_t *s_size_ptr);
 
-	static pthread_mutex_t sg_lock = PTHREAD_MUTEX_INITIALIZER;
-	static unsigned long long sg_prev_time_stamp_msec = 0ull;
-	static unsigned long long sg_consume_count = 0ull;
-	static unsigned long long sg_limited_count = 0ull;
-	unsigned long long s_time_stamp_msec;
+void *SSL_inspection_pseudo_encrypt(SSL *s_ssl, int s_socket, const void *s_plaintext_ptr, size_t s_plaintext_size, size_t *s_tls_payload_size_ptr);
 
-	int s_limited;
-	int s_errno;
-
-	s_errno = errno;
-
-	(void)pthread_mutex_lock((pthread_mutex_t *)(&sg_lock));
-	s_time_stamp_msec = SSL_inspection_get_time_stamp_msec();
-	if((sg_prev_time_stamp_msec == 0ull) || ((s_time_stamp_msec - sg_prev_time_stamp_msec) >= 1000ull)) {
-		sg_consume_count += sg_consume_per_sec;
-		if(sg_consume_count > sg_consume_per_sec) {
-			sg_consume_count = sg_consume_per_sec;
-		}
-
-		if(SSL_inspection_unlikely(sg_limited_count > 0ull)) {
-			(void)fprintf(stderr, "\n" def_hwport_color_magenta "*** RATELIMITED " def_hwport_color_white "%llu" def_hwport_color_magenta " MESSAGES ***" def_hwport_color_normal "\n\n", sg_limited_count);
-			sg_limited_count = 0ull;
-		}
-
-		sg_prev_time_stamp_msec = s_time_stamp_msec;
-	}
-
-	if(sg_consume_count > 0ull) {
-		--sg_consume_count;
-		s_limited = 0;
-	}
-	else {
-		++sg_limited_count;
-		s_limited = 1;
-	}
-	(void)pthread_mutex_unlock((pthread_mutex_t *)(&sg_lock));
-
-	errno = s_errno;
-
-	return(s_limited);
-}
-
-void SSL_inspection_perror(const char *s_prefix_message)
-{
-	if(SSL_inspection_unlikely(SSL_inspection_ratelimited_message_check() != 0)) { /* 과도한 출력 통제 */
-		return;
-	}
-
-	perror(s_prefix_message);
-}
-
-int SSL_inspection_fprintf(FILE *s_stream, const char *s_format, ...)
-{
-	int s_result;
-	va_list s_var;
-
-	if(SSL_inspection_unlikely(s_stream == ((FILE *)(NULL)))) {
-		s_stream = stdout;
-	}
-	if(SSL_inspection_unlikely(s_format == ((const char *)(NULL)))) {
-		(void)fflush(s_stream);
-		return(0);
-	}
-
-	if(SSL_inspection_unlikely(SSL_inspection_ratelimited_message_check() != 0)) { /* 과도한 출력 통제 */
-		return(0);
-	}
-
-	va_start(s_var, s_format);
-	s_result = vfprintf(s_stream, s_format, s_var);
-	va_end(s_var);
-
-	return(s_result);
-}
-
-char *SSL_inspection_cpuset_to_string(char *s_string, size_t s_limit_size, cpu_set_t *s_cpuset)
-{
-	int s_cpu;
-	int s_offset;
-
-	if(SSL_inspection_unlikely((s_string == ((char *)(NULL))) || (s_limit_size <= ((size_t)0u)))) {
-		return((char *)(NULL));
-	}
-
-	s_offset = 0;
-	s_string[s_offset] = '\0';
-	for (s_cpu = 0;(s_cpu < CPU_SETSIZE) && (((size_t)s_offset) < s_limit_size);s_cpu++) {
-		if(CPU_ISSET(s_cpu, s_cpuset)) {
-			s_offset += snprintf((char *)(&s_string[s_offset]), s_limit_size - ((size_t)s_offset), "[%d]", s_cpu);
-		}
-	}
-
-	return(s_string);
-}
-
-unsigned long long SSL_inspection_get_time_stamp_msec(void)
-{
-	struct timespec s_timespec;
-	unsigned long long s_time_stamp_msec;
-
-	if(SSL_inspection_unlikely(clock_gettime(CLOCK_MONOTONIC, (struct timespec *)(&s_timespec)) != 0)) {
-		return((unsigned long long)0u);
-	}
-
-	s_time_stamp_msec = ((unsigned long long)s_timespec.tv_sec) * ((unsigned long long)1000u); /* sec to msec */
-	s_time_stamp_msec += ((unsigned long long)s_timespec.tv_nsec) / ((unsigned long long)1000000u); /* nanosec to msec */
-
-	return(s_time_stamp_msec);
-}
-
-int SSL_inspection_msleep(int s_timeout_msec)
-{
-	struct timeval s_timeval_local;
-	int s_check;
-
-	if(s_timeout_msec < 0) {
-		s_timeout_msec = 0;
-	}
-	s_timeval_local.tv_sec = s_timeout_msec / 1000;
-	s_timeval_local.tv_usec = (s_timeout_msec % 1000) * 1000;
-
-	s_check = select(0, (fd_set *)(NULL), (fd_set *)(NULL), (fd_set *)(NULL), (struct timeval *)(&s_timeval_local));
-	if(SSL_inspection_unlikely(s_check == (-1))) {
-		SSL_inspection_perror("msleep");
-	}
-
-	return(s_check);
-}
+int SSL_inspection_pseudo_set_ktls_forward(int s_socket_client, int s_socket_server, unsigned int s_flags);
 
 void *SSL_inspection_increment_be_block(void *s_bigint_ptr, size_t s_size)
 {
-	if(SSL_inspection_unlikely(s_size <= ((size_t)0u))) {
+	if(s_size <= ((size_t)0u)) {
 		return(s_bigint_ptr);
 	}
 
@@ -260,7 +203,7 @@ void *SSL_inspection_increment_be_block(void *s_bigint_ptr, size_t s_size)
 
 void *SSL_inspection_xor_block(void *s_to_ptr, const void *s_from_ptr, size_t s_size)
 {
-	if(SSL_inspection_unlikely(s_size <= ((size_t)0u))) {
+	if(s_size <= ((size_t)0u)) {
 		return(s_to_ptr);
 	}
 
@@ -291,7 +234,7 @@ void *SSL_inspection_right_shift_block(void *s_block_ptr, size_t s_size)
 {
 	uint8_t *s_uint8_ptr;
 
-	if(SSL_inspection_unlikely(s_size <= ((size_t)0u))) {
+	if(s_size <= ((size_t)0u)) {
 		return(s_block_ptr);
 	}
 
@@ -331,7 +274,7 @@ void *SSL_inspection_convert_printable_ascii(void *s_to, const void *s_from, siz
 	const unsigned char *s_from_buffer = (const unsigned char *)s_from;
 	size_t s_offset;
 
-	if(s_to == ((void *)(NULL))) {
+	if(s_to == ((void *)0)) {
 		union {
 			const void *m_const_ptr;
 			void *m_ptr;
@@ -360,45 +303,35 @@ const void *SSL_inspection_hexdump(const char *s_prefix, const void *s_data, siz
 	(void)s_prefix;
 
 	(void)BIO_dump_fp(stdout, s_data, s_size);
-
+	
 	(void)fflush(stdout);
 
 	return(s_data);
 #else
 	size_t s_o, s_w, s_lo;
 	unsigned char s_b[ 16 + 1 ];
-	char s_m[ 64 ];
-	int s_mo;
 
-	if(SSL_inspection_unlikely(s_data == ((const void *)(NULL))))return((void *)(NULL));
+	if(s_data == ((const void *)0))return((void *)0);
 
 	s_b[sizeof(s_b) - 1] = (unsigned char)'\0';
 	for(s_o = (size_t)0;s_o < s_size;s_o += (size_t)16) {
 		s_w = ((s_size - s_o) <= ((size_t)16)) ? (s_size - s_o) : ((size_t)16);
-		s_mo = 0;
-		s_m[0] = '\0';
+		(void)fprintf(stdout, "%s%08lX", (s_prefix == ((const char *)0)) ? "" : s_prefix, (unsigned long)s_o);
 		for(s_lo = (size_t)0;s_lo < s_w;s_lo++) {
-			if(s_lo == ((size_t)(16 >> 1)))s_mo += snprintf((char *)(&s_m[s_mo]), sizeof(s_m) - s_mo, " | ");
-			else s_mo += snprintf((char *)(&s_m[s_mo]), sizeof(s_m) - s_mo, " ");
+			if(s_lo == ((size_t)(16 >> 1)))(void)fputs(" | ", stdout);
+			else (void)fputs(" ", stdout);
 			s_b[s_lo] = *(((const unsigned char *)s_data) + (s_o + s_lo));
-			s_mo += snprintf((char *)(&s_m[s_mo]), sizeof(s_m) - s_mo, "%02X", (int)s_b[s_lo]);
+			(void)fprintf(stdout, "%02X", (int)s_b[s_lo]);
 			if(SSL_inspection_is_printable_ascii((int)s_b[s_lo], 0) == 0) {
 				s_b[s_lo] = (unsigned char)'.';
 			}
 		}
 		while(s_lo < ((size_t)16)) {
-			if(s_lo == ((size_t)(16 >> 1)))s_mo += snprintf((char *)(&s_m[s_mo]), sizeof(s_m) - s_mo, "     ");
-			else s_mo += snprintf((char *)(&s_m[s_mo]), sizeof(s_m) - s_mo, "   ");
+			if(s_lo == ((size_t)(16 >> 1)))(void)fputs("     ", stdout);
+			else (void)fputs("   ", stdout);
 			s_b[s_lo] = (unsigned char)' '; s_lo++;
 		}
-		(void)SSL_inspection_fprintf(
-			stdout,
-		       	"%s%08lX%s [%s]\n",
-		       	(s_prefix == ((const char *)(NULL))) ? "" : s_prefix,
-		       	(unsigned long)s_o,
-		       	(const char *)(&s_m[0]),
-		       	(char *)(&s_b[0])
-		);
+		(void)fprintf(stdout, " [%s]\n", (char *)(&s_b[0]));
 	}
 	(void)fflush(stdout);
 
@@ -423,8 +356,8 @@ void SSL_inspection_dump_backtrace(void)
 		(void **)(&s_backtrace_buffer[0]),
 		(int)(sizeof(s_backtrace_buffer) / sizeof(void *))
 	);
-	if(SSL_inspection_unlikely(s_backtrace_size <= 0)) {
-		s_backtrace_symbols = (char **)(NULL);
+	if(s_backtrace_size <= 0) {
+		s_backtrace_symbols = (char **)0;
 	}
 	else {
 		s_backtrace_symbols = backtrace_symbols(
@@ -440,7 +373,7 @@ void SSL_inspection_dump_backtrace(void)
 			"%02d - %p - %s\n",
 			s_backtrace_index + 1,
 			s_backtrace_buffer[s_backtrace_index],
-			(s_backtrace_symbols == ((char **)(NULL))) ? "<unknown symbol>" : s_backtrace_symbols[s_backtrace_index]
+			(s_backtrace_symbols == ((char **)0)) ? "<unknown symbol>" : s_backtrace_symbols[s_backtrace_index]
 		);
 	}
 	free((void *)s_backtrace_symbols);
@@ -477,16 +410,16 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 #endif
 	}
 
-	if(s_socklen_ptr == ((socklen_t *)(NULL))) {
+	if(s_socklen_ptr == ((socklen_t *)0)) {
 		s_socklen = (socklen_t)0;
 	}
 	else {
 		s_socklen = *s_socklen_ptr;
 	}
 
-	if(s_address != ((const char *)(NULL))) {
+	if(s_address != ((const char *)0)) {
 		if(strlen(s_address) <= ((size_t)0u)) {
-			s_address = (const char *)(NULL);
+			s_address = (const char *)0;
 		}
 	}
 
@@ -494,13 +427,13 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 		struct in_addr s_in_addr;
 		struct sockaddr_in *s_sockaddr_in;
 
-		if(SSL_inspection_unlikely((s_socklen > ((socklen_t)0)) && (s_socklen < sizeof(struct sockaddr_in)))) {
+		if((s_socklen > ((socklen_t)0)) && (s_socklen < sizeof(struct sockaddr_in))) {
 			/* not enough socklen */
 			errno = EINVAL;
 			return(-1);
 		}
 
-		if(SSL_inspection_unlikely(s_port > 65535)) {
+		if(s_port > 65535) {
 			errno = EINVAL;
 			return(-1);
 		}
@@ -508,26 +441,26 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 			s_port = 0;
 		}
 
-		if(s_address == ((const char *)(NULL))) {
+		if(s_address == ((const char *)0)) {
 			s_in_addr.s_addr = htonl(INADDR_ANY);
 		}
 		else {
 			for(s_offset = (size_t)0u;s_address[s_offset] != '\0';s_offset++) {
-				if(SSL_inspection_unlikely((isdigit(s_address[s_offset]) == 0) &&
-					(s_address[s_offset] != '.'))) {
+				if((isdigit(s_address[s_offset]) == 0) &&
+					(s_address[s_offset] != '.')) {
 					errno = EINVAL;
 					return(-1);
 				}
 			}
 
 			/* IPv4 address string validation check */
-			if(SSL_inspection_unlikely(inet_pton(s_family, s_address, (void *)(&s_in_addr)) <= 0)) {
+			if(inet_pton(s_family, s_address, (void *)(&s_in_addr)) <= 0) {
 				return(-1);
 			}
 		}
 
 		s_socklen = (socklen_t)sizeof(struct sockaddr_in);
-		if(s_socklen_ptr != ((socklen_t *)(NULL))) {
+		if(s_socklen_ptr != ((socklen_t *)0)) {
 			*s_socklen_ptr = s_socklen;
 		}
 
@@ -543,13 +476,13 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 		struct in6_addr s_in6_addr;
 		struct sockaddr_in6 *s_sockaddr_in6;
 
-		if(SSL_inspection_unlikely((s_socklen > ((socklen_t)0)) && (s_socklen < sizeof(struct sockaddr_in6)))) {
+		if((s_socklen > ((socklen_t)0)) && (s_socklen < sizeof(struct sockaddr_in6))) {
 			/* not enough socklen */
 			errno = EINVAL;
 			return(-1);
 		}
 
-		if(SSL_inspection_unlikely(s_port > 65535)) {
+		if(s_port > 65535) {
 			errno = EINVAL;
 			return(-1);
 		}
@@ -557,7 +490,7 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 			s_port = 0;
 		}
 
-		if(s_address == ((const char *)(NULL))) {
+		if(s_address == ((const char *)0)) {
 			s_in6_addr = in6addr_any;
 		}
 		else {
@@ -571,13 +504,13 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 			}
 
 			/* IPv6 address string validation check */
-			if(SSL_inspection_unlikely(inet_pton(s_family, s_address, (void *)(&s_in6_addr)) <= 0)) {
+			if(inet_pton(s_family, s_address, (void *)(&s_in6_addr)) <= 0) {
 				return(-1);
 			}
 		}
 
 		s_socklen = (socklen_t)sizeof(struct sockaddr_in6);
-		if(s_socklen_ptr != ((socklen_t *)(NULL))) {
+		if(s_socklen_ptr != ((socklen_t *)0)) {
 			*s_socklen_ptr = s_socklen;
 		}
 
@@ -603,14 +536,14 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 	  ) {
 		struct sockaddr_un *s_sockaddr_un;
 
-		if(SSL_inspection_unlikely((s_socklen > ((socklen_t)0)) && (s_socklen < sizeof(struct sockaddr_un)))) {
+		if((s_socklen > ((socklen_t)0)) && (s_socklen < sizeof(struct sockaddr_un))) {
 			/* not enough socklen */
 			errno = EINVAL;
 			return(-1);
 		}
 
 		/* sun-path string validation check */
-		if(s_address == ((const char *)(NULL))) { /* "" (unnamed path) */
+		if(s_address == ((const char *)0)) { /* "" (unnamed path) */
 			s_address = "";
 		}
 		else {
@@ -637,14 +570,14 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 				}
 			}
 
-			if(SSL_inspection_unlikely(s_is_valid_sun_path == 0)) {
+			if(s_is_valid_sun_path == 0) {
 				errno = EINVAL;
 				return(-1);
 			}
 		}
 
 		s_socklen = (socklen_t)sizeof(struct sockaddr_un);
-		if(s_socklen_ptr != ((socklen_t *)(NULL))) {
+		if(s_socklen_ptr != ((socklen_t *)0)) {
 			*s_socklen_ptr = s_socklen;
 		}
 
@@ -666,98 +599,13 @@ int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s
 	return(-1);
 }
 
-int SSL_inspection_set_keepalive_socket(int s_socket, int s_is_enable, int s_keepidle_sec, int s_keepintvl_sec)
-{
-	int s_value;
-
-	s_value = (s_is_enable == 0) ? 0 : 1;
-
-	if(SSL_inspection_unlikely(setsockopt(
-		s_socket,
-		(int)(SOL_SOCKET),
-		(int)(SO_KEEPALIVE),
-		(const void *)(&s_value),
-		(socklen_t)sizeof(s_value)) == (-1))) {
-		return(-1);
-	}
-
-	if(s_is_enable <= 0) {
-		return(0);
-	}
-
-#if defined(TCP_KEEPIDLE)
-	if(s_keepidle_sec < 0) {
-		s_keepidle_sec = 60 /* default */;
-	}
-	if(SSL_inspection_unlikely(setsockopt(
-		s_socket,
-		(int)(IPPROTO_TCP),
-		(int)(TCP_KEEPIDLE),
-		(const void *)(&s_keepidle_sec),
-		(socklen_t)sizeof(s_keepidle_sec)) == (-1))) {
-		return(-1);
-	}
-#else
-	(void)s_keepidle_sec;
-#endif
-#if defined(TCP_KEEPINTVL)
-	if(s_keepintvl_sec <= 0) {
-		s_keepintvl_sec = 30 /* default */;
-	}
-	if(SSL_inspection_unlikely(setsockopt(
-		s_socket,
-		(int)(IPPROTO_TCP),
-		(int)(TCP_KEEPINTVL),
-		(const void *)(&s_keepintvl_sec),
-		(socklen_t)sizeof(s_keepintvl_sec)) == (-1))) {
-		return(-1);
-	}
-#else
-	(void)s_keepintvl_sec;
-#endif
-
-	return(0);
-}
-
-int SSL_inspection_set_linger_socket(int s_socket, int s_is_enable, int s_sec)
-{
-	struct linger s_value;
-	int s_optname;
-
-	if(s_is_enable == 0) {
-#if defined(SO_DONTLINGER)
-		s_optname = SO_DONTLINGER;
-#else
-		s_optname = SO_LINGER;
-#endif
-		s_value.l_onoff = 0;
-		s_value.l_linger = 0;
-	}
-	else {
-		s_optname = SO_LINGER;
-		s_value.l_onoff = 1;
-		s_value.l_linger = s_sec;
-	}
-
-	return(setsockopt(s_socket, SOL_SOCKET, s_optname, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
-}
-
-int SSL_inspection_set_reuse_address_socket(int s_socket, int s_is_enable)
+int SSL_inspection_set_reuse_socket(int s_socket, int s_is_enable)
 {
 	int s_value;
 
 	s_value = (s_is_enable == 0) ? 0 : 1;
 
 	return(setsockopt(s_socket, SOL_SOCKET, SO_REUSEADDR, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
-}
-
-int SSL_inspection_set_reuse_port_socket(int s_socket, int s_is_enable)
-{
-	int s_value;
-
-	s_value = (s_is_enable == 0) ? 0 : 1;
-
-	return(setsockopt(s_socket, SOL_SOCKET, SO_REUSEPORT, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
 }
 
 int SSL_inspection_set_naggle_socket(int s_socket, int s_is_enable)
@@ -767,42 +615,6 @@ int SSL_inspection_set_naggle_socket(int s_socket, int s_is_enable)
     s_value = (s_is_enable == 0) ? 1 /* naggle disabled */ : 2 /* naggle enabled */;
     
     return(setsockopt(s_socket, IPPROTO_TCP, (int)(TCP_NODELAY), (const void *)(&s_value), (socklen_t)sizeof(s_value)));
-}
-
-int SSL_inspection_set_transparent_socket(int s_socket, int s_is_enable)
-{
-	int s_value;
-	struct sockaddr_storage s_sockaddr_storage;
-	socklen_t s_socklen;
-
-	s_value = (s_is_enable == 0) ? 0 : 1;
-
-	s_socklen = (socklen_t)sizeof(s_sockaddr_storage);
-	if(getsockname(s_socket, (struct sockaddr *)(&s_sockaddr_storage), (socklen_t *)(&s_socklen)) == 0) {
-		if(s_sockaddr_storage.ss_family == AF_INET6) {
-			return(setsockopt(s_socket, SOL_IPV6, IPV6_TRANSPARENT, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
-		}
-	}
-
-	return(setsockopt(s_socket, SOL_IP, IP_TRANSPARENT, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
-}
-
-int SSL_inspection_set_freebind_socket(int s_socket, int s_is_enable)
-{
-	int s_value;
-	struct sockaddr_storage s_sockaddr_storage;
-	socklen_t s_socklen;
-
-	s_value = (s_is_enable == 0) ? 0 : 1;
-
-	s_socklen = (socklen_t)sizeof(s_sockaddr_storage);
-	if(getsockname(s_socket, (struct sockaddr *)(&s_sockaddr_storage), (socklen_t *)(&s_socklen)) == 0) {
-		if(s_sockaddr_storage.ss_family == AF_INET6) {
-			return(setsockopt(s_socket, IPPROTO_IPV6, IPV6_FREEBIND, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
-		}
-	}
-
-	return(setsockopt(s_socket, IPPROTO_IP, IP_FREEBIND, (const void *)(&s_value), (socklen_t)sizeof(s_value)));
 }
 
 int SSL_inspection_set_tx_socket_buffer_size(int s_socket, size_t s_size)
@@ -825,21 +637,38 @@ int SSL_inspection_set_rx_socket_buffer_size(int s_socket, size_t s_size)
 
 int SSL_inspection_is_readable(int s_socket, int s_timeout_msec)
 {
-	int s_poll_check;
-	struct pollfd s_pollfd[1] = {
-		{
-			.fd = s_socket,
-			.events = POLLIN,
-		},
-	};
+	fd_set s_fd_set;
+	struct timeval s_timeval_local;
+	struct timeval *s_timeval;
 
-	s_poll_check = poll((struct pollfd *)(&s_pollfd[0]), 1, s_timeout_msec);
-	if(SSL_inspection_unlikely(s_poll_check == (-1))) {
+	int s_select_check;
+
+	FD_ZERO(&s_fd_set);
+	FD_SET(s_socket, &s_fd_set);
+
+	if(s_timeout_msec < 0) {
+		s_timeval = (struct timeval *)0;
+	}
+	else {
+		s_timeval = (struct timeval *)(&s_timeval_local);
+		s_timeval->tv_sec = s_timeout_msec / 1000;
+		s_timeval->tv_usec = (s_timeout_msec % 1000) * 1000;
+	}
+
+	s_select_check = select(
+			s_socket + 1,
+			(fd_set *)(&s_fd_set),
+			(fd_set *)0,
+			(fd_set *)0,
+			s_timeval
+			);
+	if(s_select_check == (-1)) {
+		/* EINTR ? */
 		return(-1);
 	}
 
-	if((s_poll_check > 0) && (s_pollfd[0].revents & POLLIN)) {
-		return(s_poll_check);
+	if((s_select_check > 0) && (FD_ISSET(s_socket, &s_fd_set))) {
+		return(s_select_check);
 	}
 
 	return(0);
@@ -847,138 +676,41 @@ int SSL_inspection_is_readable(int s_socket, int s_timeout_msec)
 
 int SSL_inspection_is_writable(int s_socket, int s_timeout_msec)
 {
-	int s_poll_check;
-	struct pollfd s_pollfd[1] = {
-		{
-			.fd = s_socket,
-			.events = POLLOUT,
-		},
-	};
+	fd_set s_fd_set;
+	struct timeval s_timeval_local;
+	struct timeval *s_timeval;
 
-	s_poll_check = poll((struct pollfd *)(&s_pollfd[0]), 1, s_timeout_msec);
-	if(SSL_inspection_unlikely(s_poll_check == (-1))) {
+	int s_select_check;
+
+	FD_ZERO(&s_fd_set);
+	FD_SET(s_socket, &s_fd_set);
+
+	if(s_timeout_msec < 0) {
+		s_timeval = (struct timeval *)0;
+	}
+	else {
+		s_timeval = (struct timeval *)(&s_timeval_local);
+		s_timeval->tv_sec = s_timeout_msec / 1000;
+		s_timeval->tv_usec = (s_timeout_msec % 1000) * 1000;
+	}
+
+	s_select_check = select(
+		s_socket + 1,
+		(fd_set *)0,
+		(fd_set *)(&s_fd_set),
+		(fd_set *)0,
+		s_timeval
+	);
+	if(s_select_check == (-1)) {
+		/* EINTR ? */
 		return(-1);
 	}
 
-	if((s_poll_check > 0) && (s_pollfd[0].revents & POLLOUT)) {
-		return(s_poll_check);
+	if((s_select_check > 0) && (FD_ISSET(s_socket, &s_fd_set))) {
+		return(s_select_check);
 	}
 
 	return(0);
-}
-
-void SSL_inspection_wait_for_async(SSL *s_ssl)
-{
-	size_t s_numfds;
-	OSSL_ASYNC_FD *s_fds;
-
-	if(SSL_inspection_unlikely(s_ssl == ((SSL *)(NULL)))) {
-		errno = EINVAL;
-		return;
-	}
-
-	if(SSL_inspection_unlikely(SSL_get_all_async_fds(s_ssl, (OSSL_ASYNC_FD *)(NULL), (size_t *)(&s_numfds)) == 0)) {
-		return;
-	}
-	if(SSL_inspection_unlikely(s_numfds == ((size_t)0u))) {
-		return;
-	}
-
-	s_fds = (OSSL_ASYNC_FD *)malloc(sizeof(OSSL_ASYNC_FD) * s_numfds);
-	if(SSL_inspection_unlikely(s_fds == ((OSSL_ASYNC_FD *)(NULL)))) {
-		return;
-	}
-	if(SSL_inspection_unlikely(SSL_get_all_async_fds(s_ssl, (OSSL_ASYNC_FD *)s_fds, (size_t *)(&s_numfds)) == 0)) {
-		free((void *)s_fds);
-		return;
-	}
-
-	if(s_numfds == ((size_t)1u)) {
-		struct pollfd s_pollfd[1] = {
-			{
-				.fd = (int)s_fds[0],
-				.events = POLLIN,
-			},
-		};
-
-		(void)poll((struct pollfd *)(&s_pollfd[0]), 1, (-1));
-	}
-	else {
-		fd_set s_fdset;
-		size_t s_index;
-		int s_maxfd;
-
-		FD_ZERO(&s_fdset);
-		for(s_maxfd = (-1), s_index = (size_t)0u;s_index < s_numfds;s_index++) {
-			if(s_maxfd <= ((int)s_fds[s_index])) {
-				s_maxfd = (int)s_fds[s_index];
-			}
-			FD_SET((int)s_fds[s_index], &s_fdset);
-		}
-		if(s_maxfd >= 0) {
-			(void)select(s_maxfd + 1, (fd_set *)(&s_fdset), (fd_set *)(NULL), (fd_set *)(NULL), (struct timeval *)(NULL));
-		}
-	}
-
-	free((void *)s_fds);
-}
-
-int SSL_inspection_shutdown(SSL *s_ssl)
-{
-	int s_loop;
-	int s_check;
-
-	if(SSL_inspection_unlikely(s_ssl == ((SSL *)(NULL)))) {
-		errno = EINVAL;
-		return(-1);
-	}
-
-	s_loop = 0;
-	do {
-		++s_loop;
-        	/* We only do unidirectional shutdown */
-		s_check = SSL_shutdown(s_ssl);
-		if(s_check < 0) {
-			int s_ssl_error = SSL_get_error(s_ssl, s_check);
-			switch(s_ssl_error) {
-				case SSL_ERROR_WANT_READ:
-				case SSL_ERROR_WANT_WRITE:
-				case SSL_ERROR_WANT_ASYNC:
-				case SSL_ERROR_WANT_ASYNC_JOB:
-					/* We just do busy waiting. Nothing clever */
-					if(s_loop > 1000) {
-						(void)SSL_inspection_fprintf(stderr, "SSL_shutdown busy (loop=%d, error=%d)\n", s_loop, s_ssl_error);
-						break;
-					}
-					continue;
-			}
-			s_check = 0;
-		}
-	}while(s_check < 0);
-
-	return(s_check);
-}
-
-int SSL_inspection_closefd(int s_fd)
-{
-	int s_check;
-
-	do {
-		s_check = close(s_fd);
-	}while((s_check == (-1)) && (errno == EINTR));
-
-	return(s_check);
-}
-
-int SSL_inspection_closesocket(int s_socket)
-{
-	int s_check;
-
-	do {
-		s_check = close(s_socket);
-	}while((s_check == (-1)) && (errno == EINTR));
-
-	return(s_check);
 }
 
 ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec)
@@ -986,27 +718,24 @@ ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_siz
 	ssize_t s_read_bytes;
 	int s_check;
 
-	if(SSL_inspection_unlikely(s_socket == (-1))) {
+	if(s_socket == (-1)) {
 		errno = EINVAL;
 		return((ssize_t)(-1));
 	}
 
-	if(s_ssl != ((SSL *)(NULL))) {
+	if(s_ssl != ((SSL *)0)) {
 		int s_flags;
 		int s_ssl_read_bytes;
 		int s_ssl_error;
-		int s_is_async = 0;
 
 		s_flags = fcntl(s_socket, F_GETFL, 0);
 		if(s_flags != (-1)) {
-			if((s_flags & (O_NONBLOCK)) != (O_NONBLOCK)) {
-				(void)fcntl(s_socket, F_SETFL, s_flags | (O_NONBLOCK));
-			}
+			(void)fcntl(s_socket, F_SETFL, s_flags | O_NONBLOCK);
 		}
 		for(;;) {
-			if((s_is_async == 0) && (SSL_pending(s_ssl) <= 0)) {
+			if(SSL_pending(s_ssl) <= 0) {
 				s_check = SSL_inspection_is_readable(s_socket, s_timeout_msec);
-				if(SSL_inspection_unlikely(s_check == (-1))) {
+				if(s_check == (-1)) {
 					return((ssize_t)(-1));
 				}
 				if(s_check == 0) {
@@ -1014,7 +743,6 @@ ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_siz
 					return((ssize_t)(-1));
 				}
 			}
-			s_is_async = 0;
 
 			s_ssl_read_bytes = SSL_read(s_ssl, s_data, (int)s_size);
 			if(s_ssl_read_bytes > 0) {
@@ -1027,12 +755,7 @@ ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_siz
 			}
 
 			s_ssl_error = SSL_get_error(s_ssl, s_ssl_read_bytes);
-			if(s_ssl_error == SSL_ERROR_WANT_ASYNC) {
-				SSL_inspection_wait_for_async(s_ssl);
-				s_is_async = 1;
-				continue;
-			}
-			else if(s_ssl_error == SSL_ERROR_WANT_READ) {
+			if(s_ssl_error == SSL_ERROR_WANT_READ) {
 				continue;
 			}
 			else if(s_ssl_error == SSL_ERROR_WANT_WRITE) {
@@ -1061,7 +784,7 @@ ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_siz
 						break;
 					}
 					
-					(void)SSL_inspection_fprintf(
+					(void)fprintf(
 						stderr,
 						"SSL_inspection_recv failed ! (%lu: \"%s\")\n",
 						s_error_code,
@@ -1082,7 +805,7 @@ ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_siz
 
 	if(s_timeout_msec >= 0) {
 		s_check = SSL_inspection_is_readable(s_socket, s_timeout_msec);
-		if(SSL_inspection_unlikely(s_check == (-1))) {
+		if(s_check == (-1)) {
 			return((ssize_t)(-1));
 		}
 		if(s_check == 0) {
@@ -1091,9 +814,7 @@ ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_siz
 		}
 	}
 
-	do {
-		s_read_bytes = recv(s_socket, s_data, s_size, def_SSL_inspection_recv_flags); 
-	}while((s_read_bytes == ((ssize_t)(-1))) && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
+	s_read_bytes = recv(s_socket, s_data, s_size, def_SSL_inspection_recv_flags); 
 
 	return(s_read_bytes);
 }
@@ -1103,41 +824,35 @@ ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t
 	ssize_t s_write_bytes;
 	int s_check;
 
-	if(SSL_inspection_unlikely(s_socket == (-1))) {
+	if(s_socket == (-1)) {
 		errno = EINVAL;
 		return((ssize_t)(-1));
 	}
 
-	if(SSL_inspection_unlikely(s_size <= ((size_t)0u))) {
+	if(s_size <= ((size_t)0u)) {
 		return((ssize_t)0);
 	}
 
-	if(s_ssl != ((SSL *)(NULL))) {
+	if(s_ssl != ((SSL *)0)) {
 		int s_flags;
 		int s_ssl_write_bytes;
 		int s_ssl_error;
-		int s_is_async = 0;
 
 		s_flags = fcntl(s_socket, F_GETFL, 0);
 		if(s_flags != (-1)) {
-			if((s_flags & (O_NONBLOCK)) != (O_NONBLOCK)) {
-				(void)fcntl(s_socket, F_SETFL, s_flags | (O_NONBLOCK));
-			}
+			(void)fcntl(s_socket, F_SETFL, s_flags | O_NONBLOCK);
 		}
 		for(;;) {
-			if((s_is_async == 0) && (SSL_pending(s_ssl) <= 0)) {
-				s_check = SSL_inspection_is_writable(s_socket, s_timeout_msec);
-				if(SSL_inspection_unlikely(s_check == (-1))) {
-					s_write_bytes = (ssize_t)(-1);
-					break;
-				}
-				if(s_check == 0) {
-					errno = ETIME;
-					s_write_bytes = (ssize_t)(-1);
-					break;
-				}
+			s_check = SSL_inspection_is_writable(s_socket, s_timeout_msec);
+			if(s_check == (-1)) {
+				s_write_bytes = (ssize_t)(-1);
+				break;
 			}
-			s_is_async = 0;
+			if(s_check == 0) {
+				errno = ETIME;
+				s_write_bytes = (ssize_t)(-1);
+				break;
+			}
 
 			s_ssl_write_bytes = SSL_write(s_ssl, s_data, (int)s_size);
 			if(s_ssl_write_bytes > 0) {
@@ -1146,12 +861,7 @@ ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t
 			}
 
 			s_ssl_error = SSL_get_error(s_ssl, s_ssl_write_bytes);
-			if(s_ssl_error == SSL_ERROR_WANT_ASYNC) {
-				SSL_inspection_wait_for_async(s_ssl);
-				s_is_async = 1;
-				continue;
-			}
-			else if(s_ssl_error == SSL_ERROR_WANT_READ) {
+			if(s_ssl_error == SSL_ERROR_WANT_READ) {
 				continue;
 			}
 			else if(s_ssl_error == SSL_ERROR_WANT_WRITE) {
@@ -1185,7 +895,7 @@ ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t
 
 	if(s_timeout_msec >= 0) {
 		s_check = SSL_inspection_is_writable(s_socket, s_timeout_msec);
-		if(SSL_inspection_unlikely(s_check == (-1))) {
+		if(s_check == (-1)) {
 			return((ssize_t)(-1));
 		}
 		if(s_check == 0) {
@@ -1194,9 +904,7 @@ ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t
 		}
 	}
 
-	do {
-		s_write_bytes = send(s_socket, s_data, s_size, def_SSL_inspection_send_flags);
-	}while((s_write_bytes == ((ssize_t)(-1))) && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
+	s_write_bytes = send(s_socket, s_data, s_size, def_SSL_inspection_send_flags);
 
 	return(s_write_bytes);
 }
@@ -1214,7 +922,7 @@ ssize_t SSL_inspection_recv_fill(SSL *s_ssl, int s_socket, void *s_data, size_t 
 			s_size - s_offset,
 			s_timeout_msec
 		);
-		if(SSL_inspection_unlikely(s_read_bytes == ((ssize_t)(-1)))) {
+		if(s_read_bytes == ((ssize_t)(-1))) {
 			return((ssize_t)(-1));
 		}
 		if(s_read_bytes == ((ssize_t)0)) { /* disconnected */
@@ -1240,7 +948,7 @@ ssize_t SSL_inspection_send_fill(SSL *s_ssl, int s_socket, const void *s_data, s
 			s_size - s_offset,
 			s_timeout_msec
 		);
-		if(SSL_inspection_unlikely(s_write_bytes == ((ssize_t)(-1)))) {
+		if(s_write_bytes == ((ssize_t)(-1))) {
 			return((ssize_t)(-1));
 		}
 		if(s_write_bytes == ((ssize_t)0)) { /* disconnected */
@@ -1253,7 +961,7 @@ ssize_t SSL_inspection_send_fill(SSL *s_ssl, int s_socket, const void *s_data, s
 	return((ssize_t)s_offset);
 }
 
-SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_timeout_msec, int s_is_accept)
+static SSL *__SSL_inspection_ssl_connect(SSL_CTX *s_ssl_ctx, int s_socket, int s_timeout_msec)
 {
 	SSL *s_ssl;
 	int s_errno;
@@ -1261,38 +969,25 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 	int s_ssl_check;
 
 	s_ssl = SSL_new(s_ssl_ctx);
-	if(SSL_inspection_unlikely(s_ssl == ((SSL *)(NULL)))) {
+	if(s_ssl == ((SSL *)0)) {
 		errno = ENOMEM;
-		return((SSL *)(NULL));
+		return((SSL *)0);
 	}
 
-	if(s_is_accept == 0) {
-		SSL_set_connect_state(s_ssl);
-	}
-	else {
-		SSL_set_accept_state(s_ssl);
-	}
-	if(SSL_inspection_unlikely(SSL_set_fd(s_ssl, s_socket) <= 0)) {
+	if(SSL_set_fd(s_ssl, s_socket) <= 0) {
 		SSL_free(s_ssl);
 		errno = EINVAL;
-		return((SSL *)(NULL));
+		return((SSL *)0);
 	}
 
-	if(s_timeout_msec < 0) {
-		s_flags = (-1);
-	}
-	else {
-		s_flags = fcntl(s_socket, F_GETFL, 0);
-		if(s_flags != (-1)) {
-			/* 비동기 SSL connection 처리 */
-			/* non-blocking 설정을 하여 SSL_do_handshake 에서 비동기 수행하도록 합니다. */
-			if((s_flags & (O_NONBLOCK)) != (O_NONBLOCK)) {
-				(void)fcntl(s_socket, F_SETFL, s_flags | (O_NONBLOCK));
-			}
-		}
+	s_flags = fcntl(s_socket, F_GETFL, 0);
+	if(s_flags != (-1)) {
+		/* 비동기 SSL connection 처리 */
+		/* non-blocking 설정을 하여 SSL_connect 에서 비동기 수행하도록 합니다. */
+		(void)fcntl(s_socket, F_SETFL, s_flags | O_NONBLOCK);
 	}
 	for(;;) {
-		s_ssl_check = SSL_do_handshake(s_ssl);
+		s_ssl_check = SSL_connect(s_ssl);
 		s_errno = errno;
 		if(s_ssl_check == 0) {
 			/* The TLS/SSL handshake was not successful but was shut down controlled and by the specifications of the TLS/SSL protocol. */
@@ -1302,19 +997,15 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 			/* The TLS/SSL handshake was successfully completed, a TLS/SSL connection has been established. */
 			break;
 		}
-		else if(SSL_inspection_unlikely(s_ssl_check < 0)) {
+		else if(s_ssl_check < 0) {
 			int s_ssl_error;
 			int s_select_check;
 
 			s_ssl_error = SSL_get_error(s_ssl, s_ssl_check);
 			s_errno = errno;
-			if(s_ssl_error == SSL_ERROR_WANT_ASYNC) {
-				SSL_inspection_wait_for_async(s_ssl);
-				continue;
-			}
 			if(s_ssl_error == SSL_ERROR_WANT_READ) {
 				s_select_check = SSL_inspection_is_readable(s_socket, s_timeout_msec);
-				if(SSL_inspection_unlikely(s_select_check == (-1))) {
+				if(s_select_check == (-1)) {
 					break;
 				}
 				if(s_select_check == 0) {
@@ -1325,7 +1016,7 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 			}
 			if(s_ssl_error == SSL_ERROR_WANT_WRITE) {
 				s_select_check = SSL_inspection_is_writable(s_socket, s_timeout_msec);
-				if(SSL_inspection_unlikely(s_select_check == (-1))) {
+				if(s_select_check == (-1)) {
 					break;
 				}
 				if(s_select_check == 0) {
@@ -1339,7 +1030,7 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 				if((s_errno == EINPROGRESS) || (s_errno == EAGAIN) || (s_errno == EINTR)) { /* is progress ? */
 					if(SSL_want_write(s_ssl)) {
 						s_select_check = SSL_inspection_is_writable(s_socket, s_timeout_msec);
-						if(SSL_inspection_unlikely(s_select_check == (-1))) {
+						if(s_select_check == (-1)) {
 							break;
 						}
 						if(s_select_check == 0) {
@@ -1350,7 +1041,7 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 					}
 					else if(SSL_want_read(s_ssl)) {
 						s_select_check = SSL_inspection_is_readable(s_socket, s_timeout_msec);
-						if(SSL_inspection_unlikely(s_select_check == (-1))) {
+						if(s_select_check == (-1)) {
 							break;
 						}
 						if(s_select_check == 0) {
@@ -1379,7 +1070,7 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 		(void)fcntl(s_socket, F_SETFL, s_flags);
 	}
 
-	if(SSL_inspection_unlikely(s_ssl_check <= 0)) {
+	if(s_ssl_check <= 0) {
 		unsigned long s_ssl_error;
 
 		for(;;) { /* make sure the OpenSSL error queue is empty */
@@ -1388,30 +1079,32 @@ SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_tim
 				break;
 			}
 
-			(void)SSL_inspection_fprintf(stderr, "SSL_do_handshake[SSL_accept] failed ! (\"%s\")\n", ERR_error_string(s_ssl_error, NULL));
+			(void)fprintf(stderr, "SSL_connect failed ! (\"%s\")\n", ERR_error_string(s_ssl_error, NULL));
 		}
 
 		SSL_free(s_ssl);
 		errno = s_errno;
-		return((SSL *)(NULL));
+		return((SSL *)0);
 	}
 
 	return(s_ssl);
 }
 
-int SSL_inspection_connect(int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec)
+int SSL_inspection_connect(SSL_CTX *s_ssl_ctx, SSL **s_ssl_ptr, int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec)
 {
 	int s_flags;
 	int s_check;
 	int s_errno;
 		
+	if(s_ssl_ptr != ((SSL **)0)) {
+		*s_ssl_ptr = (SSL *)0;
+	}
+
 	s_flags = 0;
 	if(s_timeout_msec >= 0) {
 		s_flags = fcntl(s_socket, F_GETFL, 0);
 		if(s_flags != (-1)) {
-			if((s_flags & (O_NONBLOCK)) != (O_NONBLOCK)) {
-				(void)fcntl(s_socket, F_SETFL, s_flags | (O_NONBLOCK));
-			}
+			(void)fcntl(s_socket, F_SETFL, s_flags | O_NONBLOCK);
 		}
 	}
 
@@ -1428,10 +1121,25 @@ int SSL_inspection_connect(int s_socket, const void *s_sockaddr_ptr, socklen_t s
 l_connected:;		
 		errno = 0;
 
+		if(s_ssl_ctx == ((SSL_CTX *)0)) { /* TCP connected */
+			return(0);
+		}
+
+		if(s_ssl_ptr == ((SSL **)0)) {
+			errno = EINVAL;
+			return(-1);
+		}
+
+		/* SSL connect */
+		*s_ssl_ptr = __SSL_inspection_ssl_connect(s_ssl_ctx, s_socket, s_timeout_msec);
+		if(*s_ssl_ptr == ((SSL *)0)) {
+			return(-1);
+		}
+
 		return(0);
 	}
 
-	if(SSL_inspection_unlikely(s_check != (-1))) { /* what happen ? */
+	if(s_check != (-1)) { /* what happen ? */
 		errno = EINVAL;
 		return(-1);
 	}
@@ -1459,25 +1167,42 @@ l_connected:;
 	}
 
 	if(s_check == 0) {
-		struct pollfd s_pollfd[1] = {
-			{
-				.fd = s_socket,
-				.events = POLLIN | POLLOUT | POLLERR | POLLHUP,
-			},
-		};
+		fd_set s_fd_set_rx;
+		fd_set s_fd_set_tx;
+		fd_set s_fd_set_ex;
 
-		s_check = poll((struct pollfd *)(&s_pollfd[0]), 1, s_timeout_msec);
-		if(SSL_inspection_unlikely(s_check == (-1))) {
+		struct timeval s_timeval_local;
+		struct timeval *s_timeval;
+
+		FD_ZERO(&s_fd_set_rx);
+		FD_ZERO(&s_fd_set_tx);
+		FD_ZERO(&s_fd_set_ex);
+
+		FD_SET(s_socket, &s_fd_set_rx);
+		FD_SET(s_socket, &s_fd_set_tx);
+		FD_SET(s_socket, &s_fd_set_ex);
+
+		if(s_timeout_msec < 0) {
+			s_timeval = (struct timeval *)0;
+		}
+		else {
+			s_timeval = (struct timeval *)(&s_timeval_local);
+			s_timeval->tv_sec = s_timeout_msec / 1000;
+			s_timeval->tv_usec = (s_timeout_msec % 1000) * 1000;
+		}
+
+		s_check = select(s_socket + 1, (fd_set *)(&s_fd_set_rx), (fd_set *)(&s_fd_set_tx), (fd_set *)(&s_fd_set_ex), s_timeval);
+		if(s_check == (-1)) {
 			s_errno = errno;
 		}
-		else if((s_check > 0) && (s_pollfd[0].revents != 0)) {
+		else if((s_check > 0) && ((FD_ISSET(s_socket, &s_fd_set_rx)) || (FD_ISSET(s_socket, &s_fd_set_tx)) || (FD_ISSET(s_socket, &s_fd_set_ex)))) {
 			socklen_t s_sockerr_size;
 			int s_sockerr;
 
 			s_sockerr = 0;
 			s_sockerr_size = (socklen_t)sizeof(s_sockerr);
 			s_check = getsockopt(s_socket, SOL_SOCKET, SO_ERROR, (void *)(&s_sockerr), (socklen_t *)(&s_sockerr_size));
-			if(SSL_inspection_unlikely(s_check == (-1))) {
+			if(s_check == (-1)) {
 				s_errno = errno;
 			}
 			else if((s_check == 0) && (s_sockerr == 0)) {
@@ -1498,6 +1223,92 @@ l_connected:;
 	return(-1);
 }
 
+int SSL_inspection_simple_connect(SSL_CTX *s_ssl_ctx, SSL **s_ssl_ptr, const char *s_address, int s_port, int s_timeout_msec)
+{
+	struct sockaddr_storage s_sockaddr_remote;
+	socklen_t s_socklen_remote;
+	struct sockaddr_storage s_sockaddr_bind;
+	socklen_t s_socklen_bind;
+
+	int s_socket;
+
+	int s_check;
+		
+	if(s_ssl_ptr != ((SSL **)0)) {
+		*s_ssl_ptr = (SSL *)0;
+	}
+
+	s_socklen_remote = (socklen_t)sizeof(s_sockaddr_remote);
+	s_check = SSL_inspection_string_to_sockaddr(
+		AF_UNSPEC /* detect address family */,
+		s_address,
+		s_port,
+		(void *)(&s_sockaddr_remote),
+		(socklen_t *)(&s_socklen_remote)
+	);
+	if(s_check == (-1)) {
+		return(-1);
+	}
+	
+	s_socklen_bind = (socklen_t)sizeof(s_sockaddr_bind);
+	s_check = SSL_inspection_string_to_sockaddr(
+		s_sockaddr_remote.ss_family /* by remote */,
+		(const char *)0 /* any address */,
+		0 /* any port */,
+		(void *)(&s_sockaddr_bind),
+		(socklen_t *)(&s_socklen_bind)
+	);
+	if(s_check == (-1)) {
+		return(-1);
+	}
+
+	if(s_sockaddr_remote.ss_family == AF_INET) {
+		s_socket = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP); 
+	}
+	else if(s_sockaddr_remote.ss_family == AF_INET6) {
+		s_socket = socket(PF_INET6, SOCK_STREAM, IPPROTO_TCP); 
+	}
+	else {
+		errno = EINVAL;
+		s_socket = (-1);
+	}
+	if(s_socket == (-1)) {
+		return(-1);
+	}
+
+	s_check = bind(
+		s_socket, 
+		(struct sockaddr *)(&s_sockaddr_bind),
+		s_socklen_bind
+	);
+	if(s_check == (-1)) {
+		int s_errno;
+
+		s_errno = errno;
+		do {
+			s_check = close(s_socket);
+		}while((s_check == (-1)) && (errno == EINTR));
+		errno = s_errno;
+
+		return(-1);
+	}
+
+	s_check = SSL_inspection_connect(s_ssl_ctx, s_ssl_ptr, s_socket, (const void *)(&s_sockaddr_remote), s_socklen_remote, s_timeout_msec);
+	if(s_check == (-1)) {
+		int s_errno;
+
+		s_errno = errno;
+		do {
+			s_check = close(s_socket);
+		}while((s_check == (-1)) && (errno == EINTR));
+		errno = s_errno;
+
+		return(-1);
+	}
+
+	return(s_socket);
+}
+
 ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_plaintext, size_t s_plaintext_size, const void *s_aad, size_t s_aad_size, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_ciphertext, void *s_tag)
 {
 	EVP_CIPHER_CTX *s_evp_cipher_ctx;
@@ -1506,26 +1317,26 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	ssize_t s_ciphertext_size;
 
 	s_evp_cipher_ctx = EVP_CIPHER_CTX_new();
-	if(SSL_inspection_unlikely(s_evp_cipher_ctx == ((EVP_CIPHER_CTX *)(NULL)))) {
+	if(s_evp_cipher_ctx == ((EVP_CIPHER_CTX *)0)) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_CIPHER_CTX_new failed !\n");
+		(void)fprintf(stderr, "EVP_CIPHER_CTX_new failed !\n");
 		errno = ENOMEM;
 		return((ssize_t)(-1));
 	}
 
-	if(s_cipher == ((const EVP_CIPHER *)(NULL))) {
+	if(s_cipher == ((const EVP_CIPHER *)0)) {
 		s_cipher = EVP_aes_256_gcm();
 	}
 	s_check = EVP_EncryptInit_ex(
 		s_evp_cipher_ctx /* ctx */,
 		s_cipher /* cipher */,
-		(ENGINE *)(NULL) /* engine */,
-		(const unsigned char *)(NULL) /* key */,
-		(const unsigned char *)(NULL) /* iv */
+		(ENGINE *)0 /* engine */,
+		(const unsigned char *)0 /* key */,
+		(const unsigned char *)0 /* iv */
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptInit_ex failed !\n");
+		(void)fprintf(stderr, "EVP_EncryptInit_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1536,11 +1347,11 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		s_evp_cipher_ctx,
 		EVP_CTRL_GCM_SET_IVLEN,
 		(int)s_iv_size,
-		(void *)(NULL)
+		(void *)0
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
+		(void)fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1549,20 +1360,20 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	/* Initialise key and IV */
 	s_check = EVP_EncryptInit_ex(
 		s_evp_cipher_ctx /* ctx */,
-		(const EVP_CIPHER *)(NULL) /* cipher */,
-		(ENGINE *)(NULL) /* engine */,
+		(const EVP_CIPHER *)0 /* cipher */,
+		(ENGINE *)0 /* engine */,
 		(const unsigned char *)s_key /* key */,
 		(const unsigned char *)s_iv /* iv */
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptInit_ex failed !\n");
+		(void)fprintf(stderr, "EVP_EncryptInit_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
 	}
 
-	if((s_aad == ((const void *)(NULL))) && (s_aad_size <= ((size_t)0u))) {
+	if((s_aad == ((const void *)0)) && (s_aad_size <= ((size_t)0u))) {
 		static const uint8_t cg_empty[] = {};
 		s_aad = (const void *)(&cg_empty[0]);
 	}
@@ -1571,14 +1382,14 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	 */
 	s_check = EVP_EncryptUpdate(
 		s_evp_cipher_ctx,
-		(unsigned char *)(NULL),
+		(unsigned char *)0,
 		(int *)(&s_size),
 		(const unsigned char *)s_aad,
 		(int)s_aad_size
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptUpdate failed !\n");
+		(void)fprintf(stderr, "EVP_EncryptUpdate failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1594,9 +1405,9 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		(const unsigned char *)s_plaintext,
 		(int)s_plaintext_size
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptUpdate failed !\n");
+		(void)fprintf(stderr, "EVP_EncryptUpdate failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1611,9 +1422,9 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		((unsigned char *)s_ciphertext) + s_size,
 		(int *)(&s_size)
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptFinal_ex failed !\n");
+		(void)fprintf(stderr, "EVP_EncryptFinal_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1627,9 +1438,9 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		16,
 		(void *)s_tag
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
+		(void)fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1653,26 +1464,26 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	ssize_t s_plaintext_size;
 
 	s_evp_cipher_ctx = EVP_CIPHER_CTX_new();
-	if(SSL_inspection_unlikely(s_evp_cipher_ctx == ((EVP_CIPHER_CTX *)(NULL)))) {
+	if(s_evp_cipher_ctx == ((EVP_CIPHER_CTX *)0)) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_CIPHER_CTX_new failed !\n");
+		(void)fprintf(stderr, "EVP_CIPHER_CTX_new failed !\n");
 		errno = ENOMEM;
 		return((ssize_t)(-1));
 	}
 
-	if(s_cipher == ((const EVP_CIPHER *)(NULL))) {
+	if(s_cipher == ((const EVP_CIPHER *)0)) {
 		s_cipher = EVP_aes_128_gcm();
 	}
 	s_check = EVP_DecryptInit_ex(
 		s_evp_cipher_ctx /* ctx */,
 		s_cipher /* cipher */,
-		(ENGINE *)(NULL) /* engine */,
-		(const unsigned char *)(NULL) /* key */,
-		(const unsigned char *)(NULL) /* iv */
+		(ENGINE *)0 /* engine */,
+		(const unsigned char *)0 /* key */,
+		(const unsigned char *)0 /* iv */
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_DecryptInit_ex failed !\n");
+		(void)fprintf(stderr, "EVP_DecryptInit_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1683,11 +1494,11 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		s_evp_cipher_ctx,
 		EVP_CTRL_GCM_SET_IVLEN,
 		(int)s_iv_size,
-		(void *)(NULL)
+		(void *)0
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
+		(void)fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1696,20 +1507,20 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	/* Initialise key and IV */
 	s_check = EVP_DecryptInit_ex(
 		s_evp_cipher_ctx /* ctx */,
-		(const EVP_CIPHER *)(NULL) /* cipher */,
-		(ENGINE *)(NULL) /* engine */,
+		(const EVP_CIPHER *)0 /* cipher */,
+		(ENGINE *)0 /* engine */,
 		(const unsigned char *)s_key /* key */,
 		(const unsigned char *)s_iv /* iv */
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_DecryptInit_ex failed !\n");
+		(void)fprintf(stderr, "EVP_DecryptInit_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
 	}
 
-	if((s_aad == ((const void *)(NULL))) && (s_aad_size <= ((size_t)0u))) {
+	if((s_aad == ((const void *)0)) && (s_aad_size <= ((size_t)0u))) {
 		static const uint8_t cg_empty[] = {};
 		s_aad = (const void *)(&cg_empty[0]);
 	}
@@ -1718,14 +1529,14 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	 */
 	s_check = EVP_DecryptUpdate(
 		s_evp_cipher_ctx,
-		(unsigned char *)(NULL),
+		(unsigned char *)0,
 		(int *)(&s_size),
 		(const unsigned char *)s_aad,
 		(int)s_aad_size
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_DecryptUpdate failed !\n");
+		(void)fprintf(stderr, "EVP_DecryptUpdate failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1741,9 +1552,9 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		(const unsigned char *)s_ciphertext,
 		(int)s_ciphertext_size
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_DecryptUpdate failed !\n");
+		(void)fprintf(stderr, "EVP_DecryptUpdate failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1758,9 +1569,9 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		16,
 		(void *)s_union_ptr.m_ptr
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) {
+	if(s_check <= 0) {
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
+		(void)fprintf(stderr, "EVP_CIPHER_CTX_ctrl failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1774,9 +1585,9 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		((unsigned char *)s_plaintext) + s_size,
 		(int *)(&s_size)
 	);
-	if(SSL_inspection_unlikely(s_check <= 0)) { /* Verify failed */
+	if(s_check <= 0) { /* Verify failed */
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptFinal_ex failed !\n");
+		(void)fprintf(stderr, "EVP_EncryptFinal_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1789,6 +1600,711 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 
 	return(s_plaintext_size);
+}
+
+int SSL_inspection_dump_crypto_info(const char *s_title, const void *s_crypto_info_ptr)
+{
+	const struct tls_crypto_info *s_tls_crypto_info;
+
+	if(s_crypto_info_ptr == ((const void *)0)) {
+		errno = EINVAL;
+		return(-1);
+	}
+
+	s_tls_crypto_info = (const struct tls_crypto_info *)s_crypto_info_ptr;
+
+	if((s_tls_crypto_info->version == TLS_1_2_VERSION) && (s_tls_crypto_info->cipher_type == TLS_CIPHER_AES_GCM_128)) {
+		const struct tls12_crypto_info_aes_gcm_128 *s_crypto_info; /* in kernel header "linux/tls.h" */
+
+		s_crypto_info = (const struct tls12_crypto_info_aes_gcm_128 *)s_crypto_info_ptr;
+
+		(void)fprintf(
+			stdout,
+			"Dump crypto_info - %s\n",
+			(s_title == ((const char *)0)) ? "struct tls12_crypto_info_aes_gcm_128" : s_title 
+		);
+		(void)fprintf(stdout, "  - version : %08lXH\n", (unsigned long)s_crypto_info->info.version);
+		(void)fprintf(stdout, "  - cipher_type : %lu\n", (unsigned long)s_crypto_info->info.cipher_type);
+		(void)fprintf(stdout, "  - iv (%lu bytes)\n", (unsigned long)sizeof(s_crypto_info->iv));
+		(void)SSL_inspection_hexdump("    ", (const void *)(&s_crypto_info->iv[0]), sizeof(s_crypto_info->iv));
+		(void)fprintf(stdout, "  - key (%lu bytes)\n", (unsigned long)sizeof(s_crypto_info->key));
+		(void)SSL_inspection_hexdump("    ", (const void *)(&s_crypto_info->key[0]), sizeof(s_crypto_info->key));
+		(void)fprintf(stdout, "  - salt (%lu bytes)\n", (unsigned long)sizeof(s_crypto_info->salt));
+		(void)SSL_inspection_hexdump("    ", (const void *)(&s_crypto_info->salt[0]), sizeof(s_crypto_info->salt));
+		(void)fprintf(stdout, "  - rec_seq (%lu bytes)\n", (unsigned long)sizeof(s_crypto_info->rec_seq));
+		(void)SSL_inspection_hexdump("    ", (const void *)(&s_crypto_info->rec_seq[0]), sizeof(s_crypto_info->rec_seq));
+
+		return(0);
+	}
+
+	errno = ENOMSG;
+
+	return(-1);
+}
+
+int SSL_inspection_set_ulp(int s_socket, const void *s_name, size_t s_name_size)
+{
+	if(s_socket == (-1)) {
+		errno = EINVAL;
+		return(-1);
+	}
+
+#if defined(SOL_TCP) && defined(TCP_ULP)
+	return(
+		setsockopt(
+			s_socket,
+			SOL_TCP,
+			TCP_ULP,
+			s_name,
+			(socklen_t)s_name_size
+		)
+	);
+#else
+	errno = EPROTONOSUPPORT;
+	return(-1);
+#endif
+}
+
+int SSL_inspection_set_ulp_tls(int s_socket)
+{
+	static const char cg_tls_name[] = {"tls"};
+
+	/* ULP/TLS 설정은 ESTABLISHED 된 TCP 연결 socket 에 대해서만 설정 가능합니다. */
+	return(
+		SSL_inspection_set_ulp(
+			s_socket,
+			(const void *)(&cg_tls_name[0]),
+			sizeof(cg_tls_name) /* 4(3 + 1) bytes */
+		)
+	);
+}
+
+void *SSL_inspection_get_crypto_info(int s_socket, int s_is_encrypt, size_t *s_size_ptr)
+{
+	if(s_size_ptr != ((size_t *)0)) {
+		*s_size_ptr = (size_t)0u;
+	}
+
+	if(s_socket == (-1)) {
+		errno = EINVAL;
+		return((void *)0);
+	}
+
+#if defined(SOL_TLS)
+# if defined(TLS_RX)
+	if(s_is_encrypt == 0) {
+		socklen_t s_socklen;
+		unsigned char s_buffer[ 16 << 10 ];
+		const struct tls_crypto_info *s_tls_crypto_info;
+		void *s_crypto_info_ptr;
+		int s_check;
+
+		/* step 1 */
+		s_socklen = (socklen_t)sizeof(*s_tls_crypto_info);
+		s_check = getsockopt(
+			s_socket,
+			SOL_TLS,
+			TLS_RX,
+			(void *)(&s_buffer[0]),
+			(socklen_t *)(&s_socklen)
+		);
+		if(s_check == (-1)) {
+			return((void *)0);
+		}
+
+		if(s_socklen < ((socklen_t)sizeof(*s_tls_crypto_info))) {
+			errno = EBADMSG;
+			return((void *)0);
+		}
+
+		/* step 2 */
+		s_tls_crypto_info = (const struct tls_crypto_info *)(&s_buffer[0]);
+		if((s_tls_crypto_info->version == TLS_1_2_VERSION) && (s_tls_crypto_info->cipher_type == TLS_CIPHER_AES_GCM_128)) {
+			s_socklen = (socklen_t)sizeof(struct tls12_crypto_info_aes_gcm_128);
+			s_check = getsockopt(
+				s_socket,
+				SOL_TLS,
+				TLS_RX,
+				(void *)(&s_buffer[0]),
+				(socklen_t *)(&s_socklen)
+			);
+			if(s_check == (-1)) {
+				return((void *)0);
+			}
+		
+			if(s_socklen < ((socklen_t)sizeof(struct tls12_crypto_info_aes_gcm_128))) {
+				errno = EBADMSG;
+				return((void *)0);
+			}
+		}
+		else {
+			errno = ENOMSG;
+			return((void *)0);
+		}
+
+		s_crypto_info_ptr = malloc((size_t)s_socklen);
+		if(s_crypto_info_ptr == ((void *)0)) {
+			errno = ENOMEM;
+			return((void *)0);
+		}
+
+		if(s_size_ptr != ((size_t *)0)) {
+			*s_size_ptr = (size_t)s_socklen;
+		}
+		
+		return(s_crypto_info_ptr);
+	}
+# endif
+# if defined(TLS_TX)
+	if(s_is_encrypt != 0) {
+		socklen_t s_socklen;
+		unsigned char s_buffer[ 16 << 10 ];
+		const struct tls_crypto_info *s_tls_crypto_info;
+		void *s_crypto_info_ptr;
+		int s_check;
+
+		/* step 1 */
+		s_socklen = (socklen_t)sizeof(*s_tls_crypto_info);
+		s_check = getsockopt(
+			s_socket,
+			SOL_TLS,
+			TLS_TX,
+			(void *)(&s_buffer[0]),
+			(socklen_t *)(&s_socklen)
+		);
+		if(s_check == (-1)) {
+			return((void *)0);
+		}
+		
+		if(s_socklen < ((socklen_t)sizeof(*s_tls_crypto_info))) {
+			errno = EBADMSG;
+			return((void *)0);
+		}
+		
+		/* step 2 */
+		s_tls_crypto_info = (const struct tls_crypto_info *)(&s_buffer[0]);
+		if((s_tls_crypto_info->version == TLS_1_2_VERSION) && (s_tls_crypto_info->cipher_type == TLS_CIPHER_AES_GCM_128)) {
+			s_socklen = (socklen_t)sizeof(struct tls12_crypto_info_aes_gcm_128);
+			s_check = getsockopt(
+				s_socket,
+				SOL_TLS,
+				TLS_TX,
+				(void *)(&s_buffer[0]),
+				(socklen_t *)(&s_socklen)
+			);
+			if(s_check == (-1)) {
+				return((void *)0);
+			}
+		
+			if(s_socklen < ((socklen_t)sizeof(struct tls12_crypto_info_aes_gcm_128))) {
+				errno = EBADMSG;
+				return((void *)0);
+			}
+		}
+		else {
+			errno = ENOMSG;
+			return((void *)0);
+		}
+		
+		s_crypto_info_ptr = malloc((size_t)s_socklen);
+		if(s_crypto_info_ptr == ((void *)0)) {
+			errno = ENOMEM;
+			return((void *)0);
+		}
+		(void)memcpy(s_crypto_info_ptr, (const void *)(&s_buffer[0]), (size_t)s_socklen);
+		if(s_size_ptr != ((size_t *)0)) {
+			*s_size_ptr = (size_t)s_socklen;
+		}
+
+		return(s_crypto_info_ptr);
+	}
+# endif
+#endif
+
+	errno = EPROTONOSUPPORT;
+	return((void *)0);
+}
+
+int SSL_inspection_set_crypto_info(int s_socket, int s_is_encrypt, const void *s_crypto_info_ptr, size_t s_crypto_info_size)
+{
+	if(s_socket == (-1)) {
+		errno = EINVAL;
+		return(-1);
+	}
+
+#if defined(SOL_TLS)
+# if defined(TLS_RX)
+	if(s_is_encrypt == 0) {
+		return(
+			setsockopt(
+				s_socket,
+				SOL_TLS,
+				TLS_RX,
+				s_crypto_info_ptr,
+				(socklen_t)s_crypto_info_size
+			)
+		);
+	}
+# endif
+# if defined(TLS_TX)
+	if(s_is_encrypt != 0) {
+		return(
+			setsockopt(
+				s_socket,
+				SOL_TLS,
+				TLS_TX,
+				s_crypto_info_ptr,
+				(socklen_t)s_crypto_info_size
+			)
+		);
+	}
+# endif
+#endif
+
+	errno = EPROTONOSUPPORT;
+	return(-1);
+}
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+# if defined(__GNUC__)
+#  pragma GCC diagnostic ignored "-Wredundant-decls"
+#  pragma GCC diagnostic ignored "-Wunused-parameter"
+# endif
+#if 0L /* deprecated */
+/* for SSL->enc_read/write_ctx */
+# include "ssl_locl.h"
+#else
+# include "ssl_local.h"
+#endif
+#endif
+void *SSL_inspection_build_crypto_info(SSL *s_ssl, int s_is_encrypt, size_t *s_size_ptr)
+{
+	EVP_CIPHER_CTX *s_evp_cipher_ctx;
+
+	const SSL_CIPHER *s_ssl_cipher;
+	int s_version;
+	const char *s_version_string;
+	const char *s_cipher_name;
+	void *s_cipher_data;
+
+	const EVP_CIPHER *s_evp_cipher;
+
+	int s_type; /* NID_xxx_yyy_zzz */
+	int s_block_size; /* bytes */
+	int s_key_size; /* bytes */
+	int s_iv_size; /* bytes */
+	unsigned long s_mode; /* EVP_CIPH_xxx_MODE */
+	
+	size_t s_crypto_info_size;
+	void *s_crypto_info_ptr;
+
+	if(s_size_ptr != ((size_t *)0)) {
+		*s_size_ptr = (size_t)0u;
+	}
+
+	if(s_ssl == ((SSL *)0)) {
+		errno = EINVAL;
+		return((void *)0);
+	}
+
+	if(s_is_encrypt == 0) {
+		s_evp_cipher_ctx = s_ssl->enc_read_ctx;
+	}
+	else {
+		s_evp_cipher_ctx = s_ssl->enc_write_ctx;
+	}
+	if(s_evp_cipher_ctx == ((const EVP_CIPHER_CTX *)0)) {
+		errno = EINVAL;
+		return((void *)0);
+	}
+
+	s_ssl_cipher = SSL_get_current_cipher(s_ssl);
+	s_version = SSL_version(s_ssl);
+	s_version_string = SSL_CIPHER_get_version(s_ssl_cipher);
+	s_cipher_name = SSL_CIPHER_get_name(s_ssl_cipher);
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+	s_cipher_data = EVP_CIPHER_CTX_get_cipher_data(s_evp_cipher_ctx);
+#else
+	s_cipher_data = s_evp_cipher_ctx->cipher_data;
+#endif
+
+	(void)s_version_string;
+	(void)s_cipher_name;
+
+#if 1L
+	s_evp_cipher = EVP_CIPHER_CTX_cipher(s_evp_cipher_ctx);
+#else
+	s_evp_cipher = EVP_get_cipherbyname(s_cipher_name);
+#endif
+	s_type = EVP_CIPHER_type(s_evp_cipher);
+	s_block_size = EVP_CIPHER_block_size(s_evp_cipher);
+	s_key_size = EVP_CIPHER_key_length(s_evp_cipher);
+	s_iv_size = EVP_CIPHER_iv_length(s_evp_cipher);
+	s_mode = EVP_CIPHER_mode(s_evp_cipher);
+	
+#if 0L /* DEBUG: Master secret ... */
+	do {
+		const SSL_SESSION *s_session;
+
+		size_t s_client_random_size;
+		unsigned char s_client_random[SSL3_RANDOM_SIZE];
+		size_t s_server_random_size;
+		unsigned char s_server_random[SSL3_RANDOM_SIZE];
+		size_t s_master_key_size;
+		unsigned char s_master_key[SSL_MAX_MASTER_KEY_LENGTH];
+
+		s_session = SSL_get_session(s_ssl);
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+		s_client_random_size = SSL_get_client_random(
+			s_ssl,
+			(unsigned char *)(&s_client_random[0]),
+			sizeof(s_client_random)
+		);
+		s_server_random_size = SSL_get_server_random(
+			s_ssl,
+			(unsigned char *)(&s_server_random[0]),
+			sizeof(s_server_random)
+		);
+		s_master_key_size = SSL_SESSION_get_master_key(
+			s_session,
+			(unsigned char *)(&s_master_key[0]),
+			sizeof(s_master_key)
+		);
+#else
+		if((s_ssl->s3 != ((struct ssl3_state_st *)0)) && (s_session->master_key_length > 0)) {
+			s_client_random_size = sizeof(s_client_random);
+			(void)memcpy((void *)(&s_client_random[0]), (const void *)s_ssl->s3->client_random, s_client_random_size);
+			s_server_random_size = sizeof(s_server_random);
+			(void)memcpy((void *)(&s_server_random[0]), (const void *)s_ssl->s3->server_random, s_server_random_size);
+			s_master_key_size = (size_t)s_session->master_key_length;
+			(void)memcpy((void *)(&s_master_key[0]), (const void *)s_session->master_key, (size_t)s_session->master_key_length);
+		}
+		else {
+			s_client_random_size = (size_t)0u;
+			s_server_random_size = (size_t)0u;
+			s_master_key_size = (size_t)0u;
+		}
+#endif
+
+		(void)fprintf(stdout, "Client-Random (%lu/%lu bytes)\n", (unsigned long)s_client_random_size, (unsigned long)sizeof(s_client_random));
+		SSL_inspection_hexdump("  ", (const void *)(&s_client_random[0]), s_client_random_size);
+		(void)fprintf(stdout, "Server-Random (%lu/%lu bytes)\n", (unsigned long)s_server_random_size, (unsigned long)sizeof(s_server_random));
+		SSL_inspection_hexdump("  ", (const void *)(&s_server_random[0]), s_server_random_size);
+		(void)fprintf(stdout, "Master-Key(Master-Secret) (%lu/%lu bytes)\n", (unsigned long)s_master_key_size, (unsigned long)sizeof(s_master_key));
+		SSL_inspection_hexdump("  ", (const void *)(&s_master_key[0]), s_master_key_size);
+
+		do { /* dump key-block */
+			static const char cg_label[] = {"key expansion"};
+
+			/* Key-Block size : (mac_secret_size + key_size + iv_size) * 2 */
+			/* AES128-GCM case : mac_secret_size=0, key_size=16, iv_size=12 */
+			uint8_t s_key_block[ (/* s_mac_secret_size + */ s_key_size + s_iv_size) * 2 ];
+			uint8_t s_seed[ s_server_random_size + s_client_random_size];
+
+			(void)fprintf(stdout, "Key-Block (label=\"%s\", %lu bytes)\n", (const char *)(&cg_label[0]), (unsigned long)sizeof(s_key_block));
+
+			(void)memcpy((void *)(&s_seed[0]), (const void *)(&s_server_random[0]), s_server_random_size);
+			(void)memcpy((void *)(&s_seed[s_server_random_size]), (const void *)(&s_client_random[0]), s_client_random_size);
+			(void)hwport_pseudo_random_function_tlsv1_2_sha256(
+				(const void *)(&s_master_key[0]),
+				s_master_key_size,
+				(const void *)(&cg_label[0]),
+				strlen((const char *)(&cg_label[0])),
+				(const void *)(&s_seed[0]),
+				sizeof(s_seed),
+				(void *)(&s_key_block[0]),
+				sizeof(s_key_block)
+			);
+			(void)SSL_inspection_hexdump(
+				"  ",
+				(const void *)(&s_key_block[0]),
+				sizeof(s_key_block)
+			);
+		}while(0);
+	}while(0);
+#endif
+
+	if(((s_version == TLS1_2_VERSION) /* || (strcmp(s_version_string, "TLSv1.2") == 0) || (strcmp(s_version_string, "TLSv1/SSLv3") == 0) */) &&
+		(s_type == NID_aes_128_gcm) &&
+		(s_block_size >= 1) &&
+		(s_key_size == 16 /* TLS_CIPHER_AES_GCM_128_KEY_SIZE */) &&
+		(s_iv_size == 12 /* TLS_CIPHER_AES_GCM_128_IV_SIZE - TLS_CIPHER_AES_GCM_128_SALT_SIZE */) &&
+		(s_mode == EVP_CIPH_GCM_MODE)) {
+		struct tls12_crypto_info_aes_gcm_128 *s_crypto_info; /* in kernel header "linux/tls.h" */
+
+		const EVP_AES_GCM_CTX *s_evp_aes_gcm_ctx; /* in OpenSSL source "crypto/evp/e_aes.c" */
+
+		const unsigned char *s_key;
+		const unsigned char *s_working_iv;
+		const unsigned char *s_record_sequence;
+
+		s_crypto_info_size = sizeof(struct tls12_crypto_info_aes_gcm_128);
+		s_crypto_info_ptr = malloc(s_crypto_info_size);
+		if(s_crypto_info_ptr == ((void *)0)) {
+			errno = ENOMEM;
+			return((void *)0);
+		}
+
+		s_crypto_info = (struct tls12_crypto_info_aes_gcm_128 *)memset(
+			s_crypto_info_ptr,
+			0,
+			s_crypto_info_size
+		);
+
+		s_evp_aes_gcm_ctx = (const EVP_AES_GCM_CTX *)s_cipher_data;
+		s_key = (const unsigned char *)s_evp_aes_gcm_ctx->gcm.key;
+		s_working_iv = (const unsigned char *)s_evp_aes_gcm_ctx->iv;
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+		do {
+			static const unsigned char cg_record_sequence[ /* TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE 8 */ ] = {
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+			};
+
+			s_record_sequence = (const unsigned char *)(&cg_record_sequence[0]);
+		}while(0);
+#elif 1L /* <= OpenSSL v1.0.1p (not good idea) */
+		if(s_is_encrypt == 0) {
+			s_record_sequence = (const unsigned char *)(&s_ssl->s3->read_sequence[0]);
+		}
+		else {
+			s_record_sequence = (const unsigned char *)(&s_ssl->s3->write_sequence[0]);
+		}
+#else /* always begin 1 */
+		do {
+			static const unsigned char cg_record_sequence[ /* TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE 8 */ ] = {
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+			};
+
+			s_record_sequence = (const unsigned char *)(&cg_record_sequence[0]);
+		}while(0);
+#endif
+
+		s_crypto_info->info.version = TLS_1_2_VERSION;
+		s_crypto_info->info.cipher_type = TLS_CIPHER_AES_GCM_128 /* 51 */;
+
+		(void)memcpy((void *)(&s_crypto_info->iv[0]), (const void *)(&s_working_iv[4]), TLS_CIPHER_AES_GCM_128_IV_SIZE /* 8 */);
+		(void)memcpy((void *)(&s_crypto_info->key[0]), (const void *)(&s_key[0]), TLS_CIPHER_AES_GCM_128_KEY_SIZE /* 16 */);
+		(void)memcpy((void *)(&s_crypto_info->salt[0]), (const void *)(&s_working_iv[0]), TLS_CIPHER_AES_GCM_128_SALT_SIZE /* 4 */);
+		(void)memcpy((void *)(&s_crypto_info->rec_seq[0]), (const void *)(&s_record_sequence[0]), TLS_CIPHER_AES_GCM_128_REC_SEQ_SIZE /* 8 */);
+		/* TLS_CIPHER_AES_GCM_128_TAG_SIZE 16 */
+	}
+	else {
+#if 0L /* DEBUG */
+		(void)fprintf(
+			stdout,
+			"Not supported kTLS's crypto info (version=\"%s\"(%d), name=\"%s\", type=%d, block_size=%d, key_size=%d, iv_size=%d, mode=%lu)\n",
+			s_version_string,
+			s_version,
+			s_cipher_name,
+			s_type,
+			s_block_size,
+			s_key_size,
+			s_iv_size,
+			s_mode
+		);
+#endif
+
+		errno = ENOMSG;
+		return((void *)0);
+	}
+
+	if(s_size_ptr != ((size_t *)0)) {
+		*s_size_ptr = s_crypto_info_size;
+	}
+
+	errno = 0;
+
+	return(s_crypto_info_ptr);
+}
+
+void *SSL_inspection_pseudo_encrypt(SSL *s_ssl, int s_socket, const void *s_plaintext_ptr, size_t s_plaintext_size, size_t *s_tls_payload_size_ptr)
+{
+	int s_errno;
+
+	size_t s_tls_payload_size;
+	void *s_tls_payload_ptr;
+
+	size_t s_crypto_info_size;
+	void *s_crypto_info_ptr;
+
+	const struct tls_crypto_info *s_tls_crypto_info;
+
+	if(s_tls_payload_size_ptr != ((size_t *)0)) {
+		*s_tls_payload_size_ptr = (size_t)0u;
+	}
+
+	if(s_plaintext_size > ((size_t)(1u << 14))) { /* need fragmentation */
+		errno = EOVERFLOW;
+		return((void *)0);
+	}
+
+	if(s_ssl == ((SSL *)0)) {
+		s_crypto_info_ptr = SSL_inspection_get_crypto_info(
+			s_socket,
+			1 /* is_encrypt */,
+			(size_t *)(&s_crypto_info_size)
+		);
+	}
+	else {
+		s_crypto_info_ptr = SSL_inspection_build_crypto_info(
+			s_ssl,
+			1 /* is_encrypt */,
+			(size_t *)(&s_crypto_info_size)
+		);
+	}
+	if(s_crypto_info_ptr == ((void *)0)) {
+		return((void *)0);
+	}
+
+	s_errno = EPROTONOSUPPORT;
+	s_tls_payload_size = (size_t)0u;
+	s_tls_payload_ptr = (void *)0;
+
+	s_tls_crypto_info = (const struct tls_crypto_info *)s_crypto_info_ptr;
+	if((s_tls_crypto_info->version == TLS_1_2_VERSION) && (s_tls_crypto_info->cipher_type == TLS_CIPHER_AES_GCM_128)) {
+		size_t s_record_sequence_size;
+		size_t s_record_type_size;
+		size_t s_record_version_size;
+		size_t s_record_length_size;
+		size_t s_key_size;
+		size_t s_salt_size;
+		size_t s_iv_size;
+		size_t s_aad_size;
+		size_t s_tls_header_size;
+		size_t s_ciphertext_size;
+		size_t s_tag_size;
+	
+		/* pre calc size */
+		s_record_sequence_size = (size_t)8u;
+		s_record_type_size = (size_t)1u;
+		s_record_version_size = (size_t)2u;
+		s_record_length_size = (size_t)2u;
+		s_key_size = (size_t)16u;
+		(void)s_key_size;
+		s_salt_size = (size_t)4u;
+		s_iv_size = (size_t)8u;
+		s_aad_size = s_record_sequence_size + s_record_type_size + s_record_version_size + s_record_length_size;
+		s_tls_header_size = s_aad_size - s_record_sequence_size;
+		s_ciphertext_size = s_plaintext_size;
+		s_tag_size = (size_t)16u;
+
+		/* allocate payload */
+		s_tls_payload_size = s_tls_header_size + s_iv_size + s_ciphertext_size + s_tag_size;
+		s_tls_payload_ptr = malloc(s_tls_payload_size);
+		if(s_tls_payload_ptr == ((void *)0)) {
+			s_errno = ENOMEM;
+		}
+		else {
+			const struct tls12_crypto_info_aes_gcm_128 *s_crypto_info;
+
+			const void *s_key_ptr;
+			uint8_t s_iv_local[ 4 /* salt */ + 8 /* IV */ ];
+			void *s_salt_iv_ptr;
+
+			size_t s_offset;
+		
+			uint8_t s_aad_local[ s_aad_size ];
+			void *s_aad_ptr;
+			void *s_ciphertext_ptr;
+			void *s_tag_ptr;
+
+			ssize_t s_process_size;
+
+			s_crypto_info = (const struct tls12_crypto_info_aes_gcm_128 *)s_crypto_info_ptr;
+			
+			/* key load */
+			s_key_ptr = (const void *)(&s_crypto_info->key[0]);
+			s_salt_iv_ptr = (void *)(&s_iv_local[0]);
+			(void)memcpy(
+				(void *)(((uint8_t *)s_salt_iv_ptr) + ((size_t)0u)),
+				(const void *)(&s_crypto_info->salt[0]),
+				s_salt_size
+			);
+			(void)memcpy(
+				(void *)(((uint8_t *)s_salt_iv_ptr) + s_salt_size),
+				(const void *)(&s_crypto_info->iv[0]),
+				s_iv_size
+			);
+		
+			/* build AAD */
+			s_aad_ptr = (void *)(&s_aad_local[0]);
+			s_offset = (size_t)0u;
+			(void)memcpy(
+				(void *)(((uint8_t *)s_aad_ptr) + s_offset),
+				(const void *)(&s_crypto_info->rec_seq[0]),
+				s_record_sequence_size
+			);
+			s_offset += s_record_sequence_size;
+			*((uint8_t *)(((uint8_t *)s_aad_ptr) + s_offset)) = (uint8_t)0x17u;
+			s_offset += s_record_type_size;
+			*((uint16_t *)(((uint8_t *)s_aad_ptr) + s_offset)) = (uint16_t)htons(0x0303);
+			s_offset += s_record_version_size;
+			*((uint16_t *)(((uint8_t *)s_aad_ptr) + s_offset)) = (uint16_t)htons((uint16_t)(s_plaintext_size /* !! */));
+			s_offset += s_record_length_size;
+
+			/* mapping tls payload */
+			s_offset = (size_t)0u;
+			(void)memcpy(
+				(void *)(((uint8_t *)s_tls_payload_ptr) + s_offset),
+				(const void *)(((const uint8_t *)s_aad_ptr) + s_record_sequence_size),
+				s_tls_header_size
+			);
+			*((uint16_t *)(((uint8_t *)s_tls_payload_ptr) + s_record_type_size + s_record_version_size)) = (uint16_t)htons((uint16_t)(s_iv_size + s_ciphertext_size + s_tag_size)); /* !! update TLS record length */
+			s_offset += s_tls_header_size;
+			(void)memcpy(
+				(void *)(((uint8_t *)s_tls_payload_ptr) + s_offset),
+				(const void *)(&s_crypto_info->iv[0]),
+				s_iv_size
+			);
+			s_offset += s_iv_size;
+			s_ciphertext_ptr = (void *)(((uint8_t *)s_tls_payload_ptr) + s_offset),
+			s_offset += s_ciphertext_size;
+			s_tag_ptr = (void *)(((uint8_t *)s_tls_payload_ptr) + s_offset),
+			s_offset += s_tag_size;
+		
+			/* do encrypt */
+			s_process_size = SSL_inspection_encrypt_AES_GCM(
+				EVP_aes_128_gcm(),
+				s_plaintext_ptr,
+				s_plaintext_size,
+				s_aad_ptr,
+				s_aad_size,
+				s_key_ptr,
+				s_salt_iv_ptr,
+				s_salt_size + s_iv_size,
+				s_ciphertext_ptr,
+				s_tag_ptr
+			);
+			if(s_process_size == ((ssize_t)(-1))) {
+				s_errno = errno;
+				
+				free(s_tls_payload_ptr);
+				s_tls_payload_ptr = (void *)0;
+			}
+		}
+	}
+
+	free(s_crypto_info_ptr);
+
+	if(s_tls_payload_ptr == ((void *)0)) {
+		errno = s_errno;
+		return((void *)0);
+	}
+
+	if(s_tls_payload_size_ptr != ((size_t *)0)) {
+		*s_tls_payload_size_ptr = s_tls_payload_size;
+	}
+
+	return(s_tls_payload_ptr);
+}
+
+#if !defined(__NR_ktls_forward )
+# define __NR_ktls_forward 314
+#endif
+int SSL_inspection_pseudo_set_ktls_forward(int s_socket_client, int s_socket_server, unsigned int s_flags)
+{
+	return((int)syscall(__NR_ktls_forward, s_socket_client, s_socket_server, s_flags));
 }
 
 #endif

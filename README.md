@@ -1,103 +1,49 @@
 # SSL-Inspection-pseudocode
 
 SSL inspection 구현에 대하여 연구하면서 만들었던 테스트 소스
+* kTLS 지원 (Linux kernel level 에서 암/복호화를 수행하도록 제어, 최소 Linux kernel v4.19 이상 필요)
+* OpenSSL v1.1.1 build 포함
+* AES 암/복호화 별도 독립 구현 포함. (AES-GCM 구현 포함)
+* SHA256 및 HMAC 독립 구현 포함. (TLS v1.2 pseudo random function 포함)
+* 단순 SSL proxy 수준의 구현상태이며 kTLS 동작을 실제로 확인할 수 있는 정도의 구현입니다.
+* 소스 빌드 HOWTO
+<pre>
+    > 요구사항
+      1) 동작 환경은 적어도 Linux kernel v4.19.0 이상이 필요합니다.
+      2) Ubuntu 18.04 LTS 배포판의 경우 하기 링크를 참고하면 Linux kernel 4.19 로 반영해 볼 수 있습니다.
+         http://ubuntuhandbook.org/index.php/2018/10/linux-kernel-4-19-released-install-ubuntu/
+      3) OpenSSL 은 현재 첨부 소스내에 "OpenSSL v1.1.1u" 이 함께 빌드내에 포함되어 static link 됩니다.
+         OpenSSL 1.1.x 는 현재 kTLS 반영하기 어렵습니다. (handshake 결과에 대한 파라미터를 완전하게 뽑아낼 수 있는 방법이 아직 미지수)
+    > 빌드 방법
+      $ make
+</pre>
+* listen port 로 연결이 들어오면 connect 주소로 연결을 맺고 TLS hand shake 를 진행하며 양단의 통신 내용이 그대로 콘솔로 출력되는 정도의 구현체
+<pre>
+  - 실행방법
+    만약 8443 포트로 접속이 들어오면 1.0.0.1:443 으로 연결을 중계하도록 하고 kTLS를 활성화하려면 하기와 같이 실행합니다.
+      $ ./sslid -v --ktls -p 8443 -B 1.0.0.1 -P 443
 
-## 개요
+      "-v" 옵션은 내부적으로 EVP interface를 이용한 AES-128-GCM 을 OpenSSL에서 제대로 처리하는지를 검증하는 절차를 수행합니다.
+      "--ktls" 옵션은 TCP_ULP 를 활성화 하고 TLS 연결 소켓에 파라미터를 설정하여 커널에서 암/복호화를 수행하도록 하는 주요 기능을 동작하도록 합니다.
+      "-p" 옵션은 bind 할 포트번호를 설정합니다.
+      "-B" 옵션은 연결하고자 하는 IP 주소를 설정합니다.
+      "-P" 옵션은 연결하고자 하는 포트번호를 설정합니다.
 
-TLS 통신을 중간에서 가로채어 암/복호화하는 SSL inspection proxy 구현체입니다.
-listen port로 연결이 들어오면 connect 주소로 연결을 맺고 TLS handshake를 진행하며 양단의 통신 내용을 중계합니다.
+$ ./sslid  --help
+sslid v0.0.1-0 (Nov 14 2018 03:43:08)
+Copyrights (C) MINZKN.COM - All rights reserved.
 
-### 주요 기능
+usage: sslid [<options>]
 
-- SSL/TLS proxy 기능 (Man-in-the-Middle)
-- AES 암/복호화 독립 구현 (AES-128/192/256, ECB/CFB8/OFB8/CBC/GCM 모드)
-- SHA256 및 HMAC-SHA256 독립 구현
-- TLS v1.2 Pseudo Random Function (PRF) 구현
-- GHASH (GF(2^128) multiplication) 구현
+options:
+        -h, --help                  : help
+        -v, --verbose               : verbose
+        -b, --bind=<address>        : bind address
+        -p, --port=<port>           : bind port
+        -l, --cipher-list=<string>  : cipher suite list
+        -c, --cert=<filename>       : certificate filename
+        -k, --key=<filename>        : private key filename
+        -B, --connect=<address>     : connect address
+        -P, --connect-port=<port>   : connect port
+</pre>
 
-## 디렉토리 구조
-
-```
-ssl-inspection-pseudocode/
-├── main.c               # 메인 소스 (thread-pool, async mode 지원)
-├── sslid-lib.c          # SSL inspection 라이브러리
-├── aes.c                # AES 암/복호화 구현
-├── aes-gcm.c            # AES-GCM 구현
-├── sha256.c             # SHA256, HMAC-SHA256, PRF 구현
-├── ghash.c              # GHASH 구현
-├── test-vector.c        # 암호화 테스트 벡터
-├── signal-handler.c     # 시그널 핸들러
-├── include/             # 헤더 파일
-├── misc/                # 참고 자료
-└── openssl-aes-gcm-test-vector/  # OpenSSL AES-GCM 테스트
-```
-
-## 빌드 방법
-
-```bash
-cd trunk
-make
-
-# 환경 변수 옵션
-# DEF_ENABLE_TEST_VECTOR=<yes|no>       - Test-Vector 테스트 포함 유무
-# DEF_ENABLE_DPDK_LCORE=<yes|no>        - DPDK lcore 맵핑 사용 유무
-# PKGCONF=<pkg-config>                  - pkg-config 명령 경로
-# CROSS_COMPILE=<toolchain prefix>      - 크로스 컴파일 (예: aarch64-marvell-linux-gnu-)
-```
-
-## 실행 방법
-
-### 기본 실행
-
-```bash
-# 8443 포트로 수신하여 1.0.0.1:443으로 중계
-./sslid -p 8443 -B 1.0.0.1 -P 443
-```
-
-### 주요 옵션
-
-```
--h, --help                  도움말
--v, --verbose               상세 출력 (여러 번 사용 시 더 상세)
--b, --bind=<address>        바인드 주소
--p, --port=<port>           바인드 포트
--B, --connect=<address>     연결 대상 주소
--P, --connect-port=<port>   연결 대상 포트
--l, --cipher-list=<string>  Cipher suite 제한
--c, --cert=<filename>       CA 인증서 파일
--k, --key=<filename>        CA 키 파일
-```
-
-### trunk 전용 옵션
-
-```
--n, --no-thread             단일 프로세스 모드
---thread-pool=<count>       Thread pool 개수 (기본: CPU 개수)
---multi-listen              Worker별 추가 listen 포트 사용
---serialize-lock            SSL handshake 직렬화
--a, --async                 ASYNC 모드 사용
---nossl                     TCP proxy 모드 (SSL passthrough)
--e, --engine=<name>         OpenSSL 엔진 지정
-```
-
-### 예전 tag/20240624 전용 옵션 (kTLS) deprecated
-
-```
---ktls                      kTLS 활성화 (커널 레벨 암/복호화)
-```
-
-## 요구사항
-
-- Linux (tag/20240624의 kTLS는 커널 4.19 이상 필요)
-- GCC
-- OpenSSL 개발 라이브러리 (trunk) 또는 번들 사용 (tag/20240624)
-- pthread
-
-## 라이선스
-
-- Copyright (C) MINZKN.COM - All rights reserved.
-- GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
-
-## 저자
-
-JaeHyuk Cho <minzkn@minzkn.com>

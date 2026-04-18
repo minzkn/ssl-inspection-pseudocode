@@ -26,19 +26,14 @@ typedef struct mystruct {
 # define _GNU_SOURCE (1L)
 #endif
 
-/* C11 atomic support for thread-safe operations */
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
-# include <stdatomic.h>
-# define SSL_INSPECTION_HAS_C11_ATOMICS 1
-#else
-# define SSL_INSPECTION_HAS_C11_ATOMICS 0
-#endif
-
 /* ---- */
 
 /* 
    Header include 이전에 정의해야 하는 define 들은 여기에서 정의합니다.
 */
+#if !defined(def_sslid_ktls_enable)
+# define def_sslid_ktls_enable 1
+#endif
 
 /* ---- */
 
@@ -57,8 +52,6 @@ typedef struct mystruct {
 #include <sys/select.h>
 #include <sys/un.h>
 #include <sys/sendfile.h>
-#include <sys/epoll.h>
-#include <sys/resource.h>
 
 #include <stdio.h>
 #include <stdint.h>
@@ -68,8 +61,6 @@ typedef struct mystruct {
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
-#include <poll.h>
-#include <sched.h>
 
 #include "netinet/tcp.h"
 #include <netinet/in.h>
@@ -77,6 +68,34 @@ typedef struct mystruct {
 #include <arpa/inet.h>
 
 /* kernel header */
+
+#if def_sslid_ktls_enable != 0
+# include <linux/tls.h>
+# if !defined(TCP_ULP) /* in system header "netinet/tcp.h" */
+#  if 0L /* ALERT */
+#   warning TCP_ULP not defined ! (local define using to 31)
+#  endif
+#  define TCP_ULP 31
+# endif
+# if !defined(SOL_TLS) /* in system header "sys/socket.h" > "bits/socket.h" */
+#  if 0L /* ALERT */
+#   warning SOL_TLS not defined ! (local define using to 282)
+#  endif
+#  define SOL_TLS 282
+# endif
+# if !defined(TLS_TX) /* need linux kernel >=v4.13 - in kernel header "linux/tls.h" */
+#  if 0L /* ALERT */
+#   warning TLS_TX not defined ! (local define using to 1)
+#  endif
+#  define TLS_TX 1
+# endif
+# if !defined(TLS_RX) /* need linux kernel >=v4.19 - in kernel header "linux/tls.h"  */
+#  if 0L /* ALERT */
+#   warning TLS_RX not defined ! (local define using to 2)
+#  endif
+#  define TLS_RX 2
+# endif
+#endif
 
 /* library header */
 
@@ -101,20 +120,6 @@ typedef struct mystruct {
 
 /* ---- */
 
-#if defined(__GNUC__) && __GNUC__ >= 3L
-# define SSL_inspection_likely(m_expression) __builtin_expect((long)(m_expression),1L)
-# define SSL_inspection_unlikely(m_expression) __builtin_expect((long)(m_expression),0L)
-#else
-# define SSL_inspection_likely(m_expression) m_expression
-# define SSL_inspection_unlikely(m_expression) m_expression
-#endif
-
-#if defined(__GNUC__)
-# define SSL_inspection_vsprintf_varg_check(m_format_index,m_varg_index) __attribute__((__format__(__printf__,m_format_index,m_varg_index)))
-#else
-# define SSL_inspection_vsprintf_varg_check(m_format_index,m_varg_index)
-#endif
-
 #define def_SSL_inspection_default_program_name "sslid"
 
 #define def_SSL_inspection_listen_address "0.0.0.0" /* "0.0.0.0" or "::" */
@@ -124,16 +129,11 @@ typedef struct mystruct {
 # define def_SSL_inspection_connect_address "1.0.0.1"
 # define def_SSL_inspection_connect_port 443
 #else /* our test server */
-# define def_SSL_inspection_connect_address "192.168.0.5"
-# define def_SSL_inspection_connect_port 443
+# define def_SSL_inspection_connect_address "192.168.0.2"
+# define def_SSL_inspection_connect_port 5001
 #endif
 
-/* Socket buffer sizes (1MB each)
- * Note: Large buffers increase memory usage per connection.
- * Consider reducing for high-connection-count deployments.
- * Set to -1 to use system defaults.
- */
-#if 1L
+#if 0L
 #define def_SSL_inspection_socket_buffer_rx (1u << 20)
 #define def_SSL_inspection_socket_buffer_tx (1u << 20)
 #else
@@ -141,24 +141,29 @@ typedef struct mystruct {
 #define def_SSL_inspection_socket_buffer_tx (-1)
 #endif
 
-/* backlog: use system maximum or reasonable default
- * Note: actual value is limited by net.core.somaxconn (typically 4096 on modern Linux)
- */
-#if 1L
-#define def_SSL_inspection_backlog 4096
-#else
-#define def_SSL_inspection_backlog SOMAXCONN
-#endif
-
-#if 1L /* self-signed certificate generate */
-# define def_SSL_inspection_default_certificate_pathname ((const char *)(NULL))
-# define def_SSL_inspection_default_privatekey_pathname ((const char *)(NULL))
+#if 0L /* self-signed certificate generate */
+# define def_SSL_inspection_default_certificate_pathname ((const char *)0)
+# define def_SSL_inspection_default_privatekey_pathname ((const char *)0)
 #else
 # define def_SSL_inspection_default_certificate_pathname "./cert.pem"
 # define def_SSL_inspection_default_privatekey_pathname "./key.pem"
 #endif
 
-#if 0L /* TLSv1.2 list */
+#define def_SSL_inspection_splice_rx_size (64 << 10) /* limited 64KBytes : maximum splice */
+
+#if def_sslid_ktls_enable != 0
+# define def_SSL_inspection_cipher_list \
+	"ECDH-ECDSA-AES128-GCM-SHA256" /* 1.0.2p */\
+	":ECDH-RSA-AES128-GCM-SHA256" /* 1.0.2p */\
+	":ECDHE-ECDSA-AES128-GCM-SHA256" \
+	":ECDHE-RSA-AES128-GCM-SHA256" \
+	":DHE-RSA-AES128-GCM-SHA256" \
+	":DH-RSA-AES128-GCM-SHA256" /* 1.0.2p */ \
+	":RSA-PSK-AES128-GCM-SHA256" \
+	":DHE-PSK-AES128-GCM-SHA256" \
+	":AES128-GCM-SHA256" \
+	":PSK-AES128-GCM-SHA256"
+#elif 0L /* TLSv1.2 list */
 # define def_SSL_inspection_cipher_list \
 	"ECDHE-RSA-AES256-GCM-SHA384" \
 	":ECDHE-ECDSA-AES256-GCM-SHA384" \
@@ -241,172 +246,37 @@ typedef struct mystruct {
 	":PSK-AES128-CBC-SHA"
 #else /* all list */
 # define def_SSL_inspection_cipher_list \
-	(const char *)(NULL)
+	(const char *)0
 #endif
 
-/* SSL/TLS options: disable deprecated protocols (SSLv2, SSLv3, TLS 1.0, TLS 1.1) */
-#define def_SSL_inspection_default_options ( \
-    SSL_OP_ALL | \
-    SSL_OP_NO_ENCRYPT_THEN_MAC | \
-    SSL_OP_NO_SSLv2 | \
-    SSL_OP_NO_SSLv3 | \
-    SSL_OP_NO_TLSv1 | \
-    SSL_OP_NO_TLSv1_1 \
-)
-
 #define def_SSL_inspection_debug_flag_none 0x00000000u
+#define def_SSL_inspection_debug_flag_first_recv 0x00000001u
+#define def_SSL_inspection_debug_flag_send_delay 0x00000002u
+
+#define def_SSL_inspection_use_ktls_none 0x00000000u
+#define def_SSL_inspection_use_ktls_rx 0x00000001u
+#define def_SSL_inspection_use_ktls_tx 0x00000002u
+#define def_SSL_inspection_use_ktls_forward 0x00000004u
 
 #define def_SSL_inspection_buffer_size (1 << 14) /* limited 16KBytes : maximum TLS record size */
+typedef struct {
+	int m_is_verbose;
+	unsigned int m_debug_flags;
+	const char *m_cipher_list;
+	unsigned int m_use_ktls;
+	int m_use_splice;
+	const char *m_connect_address;
+	int m_connect_port;
 
-#define SSL_inspection_main_context_t __SSL_inspection_main_context_t
-typedef struct SSL_inspection_main_context_ts __SSL_inspection_main_context_t;
-#define SSL_inspection_session_t __SSL_inspection_session_t
-typedef struct SSL_inspect_session_ts __SSL_inspection_session_t;
-#define SSL_inspection_worker_context_t __SSL_inspection_worker_context_t
-typedef struct SSL_inspection_worker_context_ts __SSL_inspection_worker_context_t;
-
-#define def_SSL_inspection_session_flag_none 0u
-#define def_SSL_inspection_session_flag_accepted (1u << 0) /* accept 유효 상태 */
-#define def_SSL_inspection_session_flag_connected (1u << 1) /* connect 유효 상태 */
-#define def_SSL_inspection_session_flag_ssl_accepted (1u << 2) /* SSL_accept 유효 상태 */
-#define def_SSL_inspection_session_flag_ssl_connected (1u << 3) /* SSL_connect 유효 상태 */
-
-#pragma pack(push,8)
-struct SSL_inspect_session_ts {
-	SSL_inspection_session_t *m_next;
-
-	SSL_inspection_main_context_t *m_main_context;
-
-	unsigned int m_flags; /* def_SSL_inspection_session_flag_XXX */
-
+	SSL_CTX *m_ssl_ctx;
 	int m_accept_socket;
-	int m_accept_socket_flags;
-	struct sockaddr_storage m_sockaddr_accept;
-	socklen_t m_socklen_accept;
-	char *m_accept_address_string[ INET6_ADDRSTRLEN ];
-
-	SSL_CTX *m_connect_ssl_ctx;
-	int m_connect_socket;
-	int m_connect_socket_flags;
-
-	SSL *m_accept_ssl;
-	SSL *m_connect_ssl;
-
-	unsigned long long m_forward_transfer_size;
-	unsigned long long m_backward_transfer_size;
+	struct sockaddr_storage m_sockaddr_storage;
+	socklen_t m_socklen;
 
 	size_t m_buffer_size;
 	void *m_buffer;
 	void *m_dup_buffer; /* for dump */
-};
-#pragma pack(pop)
-
-#define def_SSL_inspection_worker_flag_none 0u
-
-#define def_SSL_inspection_max_worker_epoll_events (1 << 10)
-
-#pragma pack(push,8)
-struct SSL_inspection_worker_context_ts {
-	SSL_inspection_worker_context_t *m_next;
-
-	unsigned int m_flags; /* def_SSL_inspection_worker_flag_XXX */
-
-	unsigned int m_worker_index;
-#if defined(def_sslid_use_dpdk_lcore)
-	unsigned int m_lcore_id;
-#endif
-	volatile int m_running; /* for start sync up : (-1)=not-initial, 0=stopped, 1=started */
-
-	SSL_inspection_main_context_t *m_main_context;
-		
-	pthread_attr_t m_pthread_attr;
-	pthread_t m_pthread;
-
-	SSL_inspection_session_t *m_session_queue_head; /* worker process session */
-	SSL_inspection_session_t *m_session_queue_tail; /* worker process session */
-	size_t m_session_queue_count;
-
-	int m_max_epoll_events;
-	int m_epoll_fd;
-	struct epoll_event m_epoll_event;
-	struct epoll_event *m_epoll_events;
-	
-	int m_listen_socket;
-	struct sockaddr_storage m_sockaddr_listen_bind;
-	socklen_t m_socklen_listen_bind;
-
-	unsigned long long m_forward_transfer_size;
-	unsigned long long m_backward_transfer_size;
-};
-#pragma pack(pop)
-
-#pragma pack(push,8)
-struct SSL_inspection_main_context_ts {
-	unsigned int m_magic_code_begin; /* main context 가 깨졌는지 확인 용 */
-
-	const char *m_program_name;
-
-	int m_is_help;
-	int m_is_verbose;
-	const char *m_engine_name;
-	unsigned int m_debug_flags;
-	const char *m_bind_address;
-	int m_bind_port;
-	int m_use_multi_listen;
-	const char *m_cipher_list;
-	const char *m_certificate_pathname;
-	const char *m_privatekey_pathname;
-	int m_use_async;
-	const char *m_connect_address;
-	int m_connect_port;
-	size_t m_buffer_size;
-	int m_thread_model;
-	unsigned int m_max_thread_pool;
-	int m_use_ssl;
-
-	pid_t m_pid;
-	int m_cpu_count;
-	int m_exit_code;
-	int m_end_print;
-
-	int m_use_serialize_lock;
-	pthread_mutex_t m_serialize_lock;
-	pthread_cond_t m_session_queue_cond;
-	pthread_mutex_t m_session_queue_lock;
-	SSL_inspection_session_t *m_session_queue_head;
-	SSL_inspection_session_t *m_session_queue_tail;
-	size_t m_session_queue_count;
-#if SSL_INSPECTION_HAS_C11_ATOMICS
-	atomic_int m_is_enqueued; /* atomic access for thread-safe check without mutex */
-#else
-	volatile int m_is_enqueued; /* fallback: volatile (not fully thread-safe) */
-#endif
-	unsigned long long m_enqueued_session_count;
-	unsigned long long m_dequeued_session_count;
-	
-	SSL_inspection_worker_context_t *m_worker_context_head;
-	SSL_inspection_worker_context_t *m_worker_context_main;
-
-#if !defined(OPENSSL_NO_ENGINE)
-	ENGINE *m_engine;
-#endif
-#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
-	unsigned long m_ssl_options;
-#else
-	long m_ssl_options;
-#endif
-	const SSL_METHOD *m_server_ssl_method;
-	const SSL_METHOD *m_client_ssl_method;
-	SSL_CTX *m_ssl_ctx;
-	
-	struct sockaddr_storage m_sockaddr_connect_bind;
-	socklen_t m_socklen_connect_bind;
-	struct sockaddr_storage m_sockaddr_connect;
-	socklen_t m_socklen_connect;
-
-	unsigned int m_magic_code_end; /* main context 가 깨졌는지 확인 용 */
-};
-#pragma pack(pop)
+}SSL_inspection_context_t;
 
 /* ---- */
 
@@ -586,27 +456,7 @@ int aes_gmac(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_le
 
 /* ---- */
 
-#if 0L
-# define def_SSL_inspection_recv_flags 0
-# define def_SSL_inspection_send_flags 0
-#else
-# define def_SSL_inspection_recv_flags MSG_NOSIGNAL
-# define def_SSL_inspection_send_flags MSG_NOSIGNAL
-#endif
-
 #if !defined(__def_sslid_source_sslid_lib_c__)
-/* Secure memory clearing - immune to compiler optimization */
-extern void SSL_inspection_secure_memzero(void *ptr, size_t size);
-
-extern int SSL_inspection_ratelimited_message_check(void);
-extern void SSL_inspection_perror(const char *s_prefix_message);
-extern int SSL_inspection_fprintf(FILE *s_stream, const char *s_format, ...) SSL_inspection_vsprintf_varg_check(2,3);
-
-extern char *SSL_inspection_cpuset_to_string(char *s_string, size_t s_limit_size, cpu_set_t *s_cpuset);
-
-extern unsigned long long SSL_inspection_get_time_stamp_msec(void);
-extern int SSL_inspection_msleep(int s_timeout_msec);
-
 extern void *SSL_inspection_increment_be_block(void *s_bigint_ptr, size_t s_size);
 extern void *SSL_inspection_xor_block(void *s_to_ptr, const void *s_from_ptr, size_t s_size);
 extern void *SSL_inspection_right_shift_block(void *s_block_ptr, size_t s_size);
@@ -619,24 +469,13 @@ extern void SSL_inspection_dump_backtrace(void);
 
 extern int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s_port, void *s_sockaddr_ptr, socklen_t *s_socklen_ptr);
 
-extern int SSL_inspection_set_keepalive_socket(int s_socket, int s_is_enable, int s_keepidle_sec, int s_keepintvl_sec);
-extern int SSL_inspection_set_linger_socket(int s_socket, int s_is_enable, int s_sec);
-extern int SSL_inspection_set_reuse_address_socket(int s_socket, int s_is_enable);
-extern int SSL_inspection_set_reuse_port_socket(int s_socket, int s_is_enable);
+extern int SSL_inspection_set_reuse_socket(int s_socket, int s_is_enable);
 extern int SSL_inspection_set_naggle_socket(int s_socket, int s_is_enable);
-extern int SSL_inspection_set_transparent_socket(int s_socket, int s_is_enable);
-extern int SSL_inspection_set_freebind_socket(int s_socket, int s_is_enable);
 extern int SSL_inspection_set_tx_socket_buffer_size(int s_socket, size_t s_size);
 extern int SSL_inspection_set_rx_socket_buffer_size(int s_socket, size_t s_size);
 
 extern int SSL_inspection_is_readable(int s_socket, int s_timeout_msec);
 extern int SSL_inspection_is_writable(int s_socket, int s_timeout_msec);
-extern void SSL_inspection_wait_for_async(SSL *s_ssl);
-
-extern int SSL_inspection_shutdown(SSL *s_ssl);
-
-extern int SSL_inspection_closefd(int s_fd);
-extern int SSL_inspection_closesocket(int s_socket);
 
 extern ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec);
 extern ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t s_size, int s_timeout_msec);
@@ -644,17 +483,29 @@ extern ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data,
 extern ssize_t SSL_inspection_recv_fill(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec);
 extern ssize_t SSL_inspection_send_fill(SSL *s_ssl, int s_socket, const void *s_data, size_t s_size, int s_timeout_msec);
 
-extern SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_timeout_msec, int s_is_accept);
-extern int SSL_inspection_connect(int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec);
+extern int SSL_inspection_connect(SSL_CTX *s_ssl_ctx, SSL **s_ssl_ptr /* OUT */, int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec);
+extern int SSL_inspection_simple_connect(SSL_CTX *s_ssl_ctx, SSL **s_ssl_ptr /* OUT */, const char *s_address, int s_port, int s_timeout_msec);
 
 extern ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_plaintext, size_t s_plaintext_size, const void *s_aad, size_t s_aad_size, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_ciphertext, void *s_tag);
 extern ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_ciphertext, size_t s_ciphertext_size, const void *s_aad, size_t s_aad_size, const void *s_tag, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_plaintext);
+
+extern int SSL_inspection_dump_crypto_info(const char *s_title, const void *s_crypto_info_ptr);
+
+extern int SSL_inspection_set_ulp(int s_socket, const void *s_name, size_t s_name_size);
+extern int SSL_inspection_set_ulp_tls(int s_socket);
+extern void *SSL_inspection_get_crypto_info(int s_socket, int s_is_encrypt, size_t *s_size_ptr);
+extern int SSL_inspection_set_crypto_info(int s_socket, int s_is_encrypt, const void *s_crypto_info_ptr, size_t s_crypto_info_size);
+
+extern void *SSL_inspection_build_crypto_info(SSL *s_ssl, int s_is_encrypt, size_t *s_size_ptr);
+
+extern void *SSL_inspection_pseudo_encrypt(SSL *s_ssl, int s_socket, const void *s_plaintext_ptr, size_t s_plaintext_size, size_t *s_tls_payload_size_ptr);
+
+extern int SSL_inspection_pseudo_set_ktls_forward(int s_socket_client, int s_socket_server, unsigned int s_flags);
 #endif
 
 /* ---- */
 
 #if !defined(__def_sslid_source_test_vector_c__)
-# if defined(def_sslid_test_vector)
 extern int SSL_inspection_sha256_test0(int s_is_verbose);
 
 extern int SSL_inspection_hmac_sha256_test0(int s_is_verbose);
@@ -666,7 +517,6 @@ extern int SSL_inspection_evp_test0(int s_is_verbose);
 extern int SSL_inspection_evp_test1(int s_is_verbose);
 
 extern int SSL_inspection_internal_impl_test0(int s_is_verbose);
-# endif
 #endif
 
 /* ---- */
@@ -676,27 +526,6 @@ extern void SSL_inspection_break_main_loop(void);
 extern int SSL_inspection_is_break_main_loop(void);
 
 extern int SSL_inspection_install_signal_handler(void);
-#endif
-
-/* ---- */
-
-#if !defined(__def_sslid_source_main_c__)
-extern SSL_inspection_session_t *SSL_inspection_new_and_accept_session(SSL_inspection_main_context_t *s_main_context, int s_listen_socket);
-extern SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *s_session);
-extern SSL_inspection_session_t *SSL_inspection_free_session_list(SSL_inspection_session_t *s_session_list);
-
-extern size_t SSL_inspection_enqueue_session_list(SSL_inspection_main_context_t *s_main_context, SSL_inspection_session_t *s_session_list);
-extern size_t SSL_inspection_dequeue_session_list(SSL_inspection_main_context_t *s_main_context, size_t s_request_session_count, SSL_inspection_session_t **s_session_head_ptr, SSL_inspection_session_t **s_session_tail_ptr, int s_timeout_msec);
-
-extern SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_context, int s_is_server_side);
-
-extern size_t SSL_inspection_checkout_worker_session(SSL_inspection_worker_context_t *s_worker_context, size_t s_request_session_count, int s_timeout_msec);
-
-extern int SSL_inspection_add_worker(SSL_inspection_main_context_t *s_main_context, unsigned int s_worker_index, unsigned int s_flags);
-extern SSL_inspection_worker_context_t *SSL_inspection_free_worker(SSL_inspection_worker_context_t *s_worker_context);
-
-extern int SSL_inspection_do_session_event(SSL_inspection_worker_context_t *s_worker_context, SSL_inspection_session_t *s_session, struct epoll_event *s_epoll_event, int s_epoll_session_type);
-extern void *SSL_inspection_worker_handler(void *s_context_ptr);
 #endif
 
 /* ---- */

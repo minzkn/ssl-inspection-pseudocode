@@ -60,11 +60,10 @@ hwport_sha256_t *hwport_init_sha256(hwport_sha256_t *s_sha256)
 
 static void hwport_sha256_burn_stack(size_t s_size)
 {
-    uint8_t s_buffer[128];
+    uint8_t s_buffer[ 128 ];
 
-    /* Use secure memory clearing to prevent compiler optimization */
-    SSL_inspection_secure_memzero(&s_buffer[0], sizeof(s_buffer));
-    if (s_size > sizeof(s_buffer)) {
+    (void)memset((void *)(&s_buffer[0]), 0, sizeof(s_buffer));
+    if(s_size > sizeof(s_buffer)) {
         hwport_sha256_burn_stack(s_size - sizeof(s_buffer));
     }
 }
@@ -248,8 +247,8 @@ void *hwport_sha256_digest(hwport_sha256_t *s_sha256, void *s_digest)
     (void)hwport_sha256_push(s_sha256, (const void *)(&sg_sha256_padding[0]), s_padd_size);
     (void)hwport_sha256_push(s_sha256, (const void *)(&s_length_pad), sizeof(uint64_t));
 
-    if(s_digest == ((void *)(NULL))) {
-        return((void *)(NULL));
+    if(s_digest == ((void *)0)) {
+        return((void *)0);
     }
         
     /* get digest */
