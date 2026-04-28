@@ -764,7 +764,7 @@ int SSL_inspection_set_naggle_socket(int s_socket, int s_is_enable)
 {
     int s_value;
 
-    s_value = (s_is_enable == 0) ? 1 /* naggle disabled */ : 2 /* naggle enabled */;
+    s_value = (s_is_enable == 0) ? 1 /* TCP_NODELAY on: Nagle disabled */ : 0 /* TCP_NODELAY off: Nagle enabled */;
     
     return(setsockopt(s_socket, IPPROTO_TCP, (int)(TCP_NODELAY), (const void *)(&s_value), (socklen_t)sizeof(s_value)));
 }
@@ -893,30 +893,19 @@ void SSL_inspection_wait_for_async(SSL *s_ssl)
 		return;
 	}
 
-	if(s_numfds == ((size_t)1u)) {
-		struct pollfd s_pollfd[1] = {
-			{
-				.fd = (int)s_fds[0],
-				.events = POLLIN,
-			},
-		};
-
-		(void)poll((struct pollfd *)(&s_pollfd[0]), 1, (-1));
-	}
-	else {
-		fd_set s_fdset;
+	{
+		struct pollfd *s_pollfds;
 		size_t s_index;
-		int s_maxfd;
 
-		FD_ZERO(&s_fdset);
-		for(s_maxfd = (-1), s_index = (size_t)0u;s_index < s_numfds;s_index++) {
-			if(s_maxfd <= ((int)s_fds[s_index])) {
-				s_maxfd = (int)s_fds[s_index];
+		s_pollfds = (struct pollfd *)malloc(sizeof(struct pollfd) * s_numfds);
+		if(s_pollfds != ((struct pollfd *)(NULL))) {
+			for(s_index = (size_t)0u;s_index < s_numfds;s_index++) {
+				s_pollfds[s_index].fd = (int)s_fds[s_index];
+				s_pollfds[s_index].events = POLLIN;
+				s_pollfds[s_index].revents = 0;
 			}
-			FD_SET((int)s_fds[s_index], &s_fdset);
-		}
-		if(s_maxfd >= 0) {
-			(void)select(s_maxfd + 1, (fd_set *)(&s_fdset), (fd_set *)(NULL), (fd_set *)(NULL), (struct timeval *)(NULL));
+			(void)poll(s_pollfds, (nfds_t)s_numfds, (-1));
+			free((void *)s_pollfds);
 		}
 	}
 
@@ -945,10 +934,15 @@ int SSL_inspection_shutdown(SSL *s_ssl)
 				case SSL_ERROR_WANT_WRITE:
 				case SSL_ERROR_WANT_ASYNC:
 				case SSL_ERROR_WANT_ASYNC_JOB:
-					/* We just do busy waiting. Nothing clever */
 					if(s_loop > 1000) {
 						(void)SSL_inspection_fprintf(stderr, "SSL_shutdown busy (loop=%d, error=%d)\n", s_loop, s_ssl_error);
 						break;
+					}
+					/* Brief sleep avoids spinning at 100% CPU while waiting
+					 * for the peer's close_notify on a non-blocking socket. */
+					{
+						struct timespec ts = {0, 1000000}; /* 1 ms */
+						(void)nanosleep(&ts, (struct timespec *)(NULL));
 					}
 					continue;
 			}
@@ -1563,19 +1557,24 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	}
 
 	if((s_aad == ((const void *)(NULL))) && (s_aad_size <= ((size_t)0u))) {
-		static const uint8_t cg_empty[] = {};
+		static const uint8_t cg_empty[1] = {0};
 		s_aad = (const void *)(&cg_empty[0]);
 	}
 	/* Provide any AAD data. This can be called zero or more times as
 	 * required
 	 */
-	s_check = EVP_EncryptUpdate(
-		s_evp_cipher_ctx,
-		(unsigned char *)(NULL),
-		(int *)(&s_size),
-		(const unsigned char *)s_aad,
-		(int)s_aad_size
-	);
+	{
+		/* Use a separate variable so the AAD-phase output length does not
+		 * overwrite s_size, which is used for the plaintext phase below. */
+		int s_aad_out_len = 0;
+		s_check = EVP_EncryptUpdate(
+			s_evp_cipher_ctx,
+			(unsigned char *)(NULL),
+			&s_aad_out_len,
+			(const unsigned char *)s_aad,
+			(int)s_aad_size
+		);
+	}
 	if(SSL_inspection_unlikely(s_check <= 0)) {
 		ERR_print_errors_fp(stderr);
 		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptUpdate failed !\n");
@@ -1635,7 +1634,6 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		return((ssize_t)(-1));
 	}
 
-	EVP_CIPHER_CTX_cleanup(s_evp_cipher_ctx);
 	EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 
 	return(s_ciphertext_size);
@@ -1710,19 +1708,24 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	}
 
 	if((s_aad == ((const void *)(NULL))) && (s_aad_size <= ((size_t)0u))) {
-		static const uint8_t cg_empty[] = {};
+		static const uint8_t cg_empty[1] = {0};
 		s_aad = (const void *)(&cg_empty[0]);
 	}
 	/* Provide any AAD data. This can be called zero or more times as
 	 * required
 	 */
-	s_check = EVP_DecryptUpdate(
-		s_evp_cipher_ctx,
-		(unsigned char *)(NULL),
-		(int *)(&s_size),
-		(const unsigned char *)s_aad,
-		(int)s_aad_size
-	);
+	{
+		/* Use a separate variable so the AAD-phase output length does not
+		 * overwrite s_size, which is used for the ciphertext phase below. */
+		int s_aad_out_len = 0;
+		s_check = EVP_DecryptUpdate(
+			s_evp_cipher_ctx,
+			(unsigned char *)(NULL),
+			&s_aad_out_len,
+			(const unsigned char *)s_aad,
+			(int)s_aad_size
+		);
+	}
 	if(SSL_inspection_unlikely(s_check <= 0)) {
 		ERR_print_errors_fp(stderr);
 		(void)SSL_inspection_fprintf(stderr, "EVP_DecryptUpdate failed !\n");
@@ -1776,7 +1779,7 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	);
 	if(SSL_inspection_unlikely(s_check <= 0)) { /* Verify failed */
 		ERR_print_errors_fp(stderr);
-		(void)SSL_inspection_fprintf(stderr, "EVP_EncryptFinal_ex failed !\n");
+		(void)SSL_inspection_fprintf(stderr, "EVP_DecryptFinal_ex failed !\n");
 		EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 		errno = EINVAL;
 		return((ssize_t)(-1));
@@ -1785,7 +1788,6 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		s_plaintext_size += (ssize_t)s_size;
 	}
 
-	EVP_CIPHER_CTX_cleanup(s_evp_cipher_ctx);
 	EVP_CIPHER_CTX_free(s_evp_cipher_ctx);
 
 	return(s_plaintext_size);

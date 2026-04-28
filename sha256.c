@@ -60,12 +60,12 @@ hwport_sha256_t *hwport_init_sha256(hwport_sha256_t *s_sha256)
 
 static void hwport_sha256_burn_stack(size_t s_size)
 {
-    uint8_t s_buffer[128];
-
-    /* Use secure memory clearing to prevent compiler optimization */
-    SSL_inspection_secure_memzero(&s_buffer[0], sizeof(s_buffer));
-    if (s_size > sizeof(s_buffer)) {
-        hwport_sha256_burn_stack(s_size - sizeof(s_buffer));
+    /* Iterative stack burn to avoid unbounded recursion on large s_size */
+    while (s_size > (size_t)0u) {
+        uint8_t s_buffer[128];
+        size_t s_chunk = (s_size < sizeof(s_buffer)) ? s_size : sizeof(s_buffer);
+        SSL_inspection_secure_memzero(&s_buffer[0], s_chunk);
+        s_size -= s_chunk;
     }
 }
 
@@ -273,9 +273,8 @@ void *hwport_sha256_simple(const void *s_data, size_t s_size, void *s_digest)
 	);
 
 	(void)hwport_sha256_digest((hwport_sha256_t *)(&s_sha256_local), s_digest);
-	
-	/* memwipe */
-	(void)memset((void *)(&s_sha256_local), 0, sizeof(s_sha256_local));
+
+	SSL_inspection_secure_memzero((void *)(&s_sha256_local), sizeof(s_sha256_local));
 
 	return(s_digest);
 }
@@ -331,14 +330,14 @@ void *hwport_hmac_sha256_digest(hwport_sha256_t *s_sha256, void *s_digest)
 		(const void *)(&s_sha256->m_key_pad[0]),
 		sizeof(s_sha256->m_key_pad)
 	);
-	(void)memset((void *)(&s_sha256->m_key_pad[0]), 0, sizeof(s_sha256->m_key_pad));
+	SSL_inspection_secure_memzero((void *)(&s_sha256->m_key_pad[0]), sizeof(s_sha256->m_key_pad));
 
 	(void)hwport_sha256_push(
 		s_sha256,
 		(const void *)(&s_sha256->m_key[0]),
 		s_sha256->m_key_size
 	);
-	(void)memset((void *)(&s_sha256->m_key[0]), 0, sizeof(s_sha256->m_key));
+	SSL_inspection_secure_memzero((void *)(&s_sha256->m_key[0]), sizeof(s_sha256->m_key));
 
 	return(hwport_sha256_digest(s_sha256, s_digest));
 }
@@ -358,9 +357,8 @@ void *hwport_hmac_sha256_simple(const void *s_key, size_t s_key_size, const void
 	);
 
 	(void)hwport_hmac_sha256_digest((hwport_sha256_t *)(&s_sha256_local), s_digest);
-	
-	/* memwipe */
-	(void)memset((void *)(&s_sha256_local), 0, sizeof(s_sha256_local));
+
+	SSL_inspection_secure_memzero((void *)(&s_sha256_local), sizeof(s_sha256_local));
 
 	return(s_digest);
 }
@@ -438,10 +436,9 @@ void *hwport_pseudo_random_function_tlsv1_2_sha256(const void *s_secret, size_t 
 #endif
 	}
 
-	/* memwipe */
-	(void)memset((void *)(&s_digest_local_P[0]), 0, sizeof(s_digest_local_P));
-	(void)memset((void *)(&s_digest_local_A[0]), 0, sizeof(s_digest_local_A));
-	(void)memset((void *)(&s_sha256_local), 0, sizeof(s_sha256_local));
+	SSL_inspection_secure_memzero((void *)(&s_digest_local_P[0]), sizeof(s_digest_local_P));
+	SSL_inspection_secure_memzero((void *)(&s_digest_local_A[0]), sizeof(s_digest_local_A));
+	SSL_inspection_secure_memzero((void *)(&s_sha256_local), sizeof(s_sha256_local));
 #else /* by OpenSSL */
 	HMAC_CTX *s_hmac_ctx;
 	const EVP_MD *c_evp_md;

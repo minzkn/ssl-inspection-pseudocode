@@ -76,7 +76,7 @@ static void aes_gctr(void *aes, const uint8_t *icb, const uint8_t *x, size_t xle
 		);
 	}
 
-	last = ((size_t)x) + xlen - ((size_t)xpos);
+	last = xlen - n * (size_t)16u;
 	if (last) {
 		/* Last, partial block */
 		(void)hwport_encrypt_aes128_ecb(
@@ -185,7 +185,7 @@ int aes_gcm_ae(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_
 	/* - */
 
 	/* clean round key */
-	(void)memset((void *)(&s_round_key[0]), 0, sizeof(s_round_key));
+	SSL_inspection_secure_memzero((void *)(&s_round_key[0]), sizeof(s_round_key));
 
 	return 0;
 }
@@ -229,11 +229,12 @@ int aes_gcm_ad(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_
 	/* - */
 
 	/* clean round key */
-	(void)memset((void *)(&s_round_key[0]), 0, sizeof(s_round_key));
+	SSL_inspection_secure_memzero((void *)(&s_round_key[0]), sizeof(s_round_key));
 
 	/* - */
 
-	if (memcmp(tag, T, 16) != 0) { /* GCM: Tag mismatch ! */
+	/* Constant-time tag comparison to prevent timing oracle attacks */
+	if (CRYPTO_memcmp(tag, T, 16) != 0) { /* GCM: Tag mismatch ! */
 		return -1;
 	}
 

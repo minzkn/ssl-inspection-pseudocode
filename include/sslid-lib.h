@@ -71,10 +71,11 @@ typedef struct mystruct {
 #include <poll.h>
 #include <sched.h>
 
-#include "netinet/tcp.h"
+#include <netinet/tcp.h>
 #include <netinet/in.h>
 
 #include <arpa/inet.h>
+#include <netdb.h>
 
 /* kernel header */
 
@@ -82,22 +83,26 @@ typedef struct mystruct {
 
 #include <pthread.h>
 
-#include "openssl/conf.h"
-#include "openssl/engine.h"
-#include "openssl/evp.h"
-#include "openssl/bio.h"
-#include "openssl/ssl.h"
-#include "openssl/err.h"
-#include "openssl/pem.h"
-#include "openssl/x509.h"
-#include "openssl/x509_vfy.h"
+#include <openssl/conf.h>
+#include <openssl/engine.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
 
-#include "openssl/modes.h"
-#include "openssl/aes.h"
+#include <openssl/modes.h>
+#include <openssl/aes.h>
 
-#include "openssl/md5.h"
+#include <openssl/md5.h>
 
-#include "openssl/hmac.h"
+#include <openssl/hmac.h>
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+# include <openssl/provider.h>
+#endif
 
 /* ---- */
 
@@ -120,13 +125,8 @@ typedef struct mystruct {
 #define def_SSL_inspection_listen_address "0.0.0.0" /* "0.0.0.0" or "::" */
 #define def_SSL_inspection_listen_port 8443 /* listen port */
 
-#if 1L /* test to cloud clare */
-# define def_SSL_inspection_connect_address "1.0.0.1"
-# define def_SSL_inspection_connect_port 443
-#else /* our test server */
-# define def_SSL_inspection_connect_address "192.168.0.5"
-# define def_SSL_inspection_connect_port 443
-#endif
+#define def_SSL_inspection_connect_address "1.0.0.1"
+#define def_SSL_inspection_connect_port 443
 
 /* Socket buffer sizes (1MB each)
  * Note: Large buffers increase memory usage per connection.
@@ -264,30 +264,95 @@ typedef struct SSL_inspection_main_context_ts __SSL_inspection_main_context_t;
 typedef struct SSL_inspect_session_ts __SSL_inspection_session_t;
 #define SSL_inspection_worker_context_t __SSL_inspection_worker_context_t
 typedef struct SSL_inspection_worker_context_ts __SSL_inspection_worker_context_t;
+#define SSL_inspection_epoll_item_t __SSL_inspection_epoll_item_t
+typedef struct SSL_inspection_epoll_item_ts __SSL_inspection_epoll_item_t;
+#define SSL_inspection_async_wait_t __SSL_inspection_async_wait_t
+typedef struct SSL_inspection_async_wait_ts __SSL_inspection_async_wait_t;
 
 #define def_SSL_inspection_session_flag_none 0u
 #define def_SSL_inspection_session_flag_accepted (1u << 0) /* accept 유효 상태 */
 #define def_SSL_inspection_session_flag_connected (1u << 1) /* connect 유효 상태 */
 #define def_SSL_inspection_session_flag_ssl_accepted (1u << 2) /* SSL_accept 유효 상태 */
 #define def_SSL_inspection_session_flag_ssl_connected (1u << 3) /* SSL_connect 유효 상태 */
+#define def_SSL_inspection_session_flag_tproxy_no_spoof (1u << 4) /* TPROXY fallback 적용: connect 소켓 소스 스푸핑 생략 */
+
+#define def_SSL_inspection_session_state_none 0u
+#define def_SSL_inspection_session_state_connecting 1u
+#define def_SSL_inspection_session_state_connect_ssl_handshake 2u
+#define def_SSL_inspection_session_state_accept_ssl_handshake 3u
+#define def_SSL_inspection_session_state_stream 4u
+#define def_SSL_inspection_session_state_closing 5u
+#define def_SSL_inspection_session_state_peek_client_hello 6u
+
+#define def_SSL_inspection_session_job_flag_none 0u
+#define def_SSL_inspection_session_job_flag_enqueued (1u << 0)
+
+#define def_SSL_inspection_epoll_item_type_none 0u
+#define def_SSL_inspection_epoll_item_type_listen 1u
+#define def_SSL_inspection_epoll_item_type_accept_socket 2u
+#define def_SSL_inspection_epoll_item_type_connect_socket 3u
+#define def_SSL_inspection_epoll_item_type_accept_async 4u
+#define def_SSL_inspection_epoll_item_type_connect_async 5u
+
+#pragma pack(push,8)
+struct SSL_inspection_epoll_item_ts {
+	SSL_inspection_worker_context_t *m_worker_context;
+	SSL_inspection_session_t *m_session;
+	OSSL_ASYNC_FD m_fd;
+	uint32_t m_events;
+	unsigned int m_type;
+	int m_is_registered;
+};
+#pragma pack(pop)
+
+#define def_SSL_inspection_async_wait_inline_capacity 4
+
+#pragma pack(push,8)
+struct SSL_inspection_async_wait_ts {
+	SSL_inspection_epoll_item_t *m_epoll_items;
+	OSSL_ASYNC_FD *m_fds;
+	size_t m_count;
+	/* inline scratch avoids heap allocation when async FD count ≤ capacity */
+	SSL_inspection_epoll_item_t m_inline_epoll_items[def_SSL_inspection_async_wait_inline_capacity];
+	OSSL_ASYNC_FD m_inline_fds[def_SSL_inspection_async_wait_inline_capacity];
+};
+#pragma pack(pop)
 
 #pragma pack(push,8)
 struct SSL_inspect_session_ts {
 	SSL_inspection_session_t *m_next;
+	SSL_inspection_session_t *m_prev; /* doubly-linked for O(1) worker-queue unlink */
+	SSL_inspection_session_t *m_job_next;
 
 	SSL_inspection_main_context_t *m_main_context;
+	SSL_inspection_worker_context_t *m_worker_context;
 
 	unsigned int m_flags; /* def_SSL_inspection_session_flag_XXX */
+	unsigned int m_state;
+	unsigned int m_job_flags;
+
+	uint32_t m_accept_ready_events;
+	uint32_t m_connect_ready_events;
+	uint32_t m_accept_epoll_interest;
+	uint32_t m_connect_epoll_interest;
+
+	SSL_inspection_epoll_item_t m_accept_epoll_item;
+	SSL_inspection_epoll_item_t m_connect_epoll_item;
+	SSL_inspection_async_wait_t m_accept_async_wait;
+	SSL_inspection_async_wait_t m_connect_async_wait;
 
 	int m_accept_socket;
 	int m_accept_socket_flags;
 	struct sockaddr_storage m_sockaddr_accept;
 	socklen_t m_socklen_accept;
-	char *m_accept_address_string[ INET6_ADDRSTRLEN ];
+	char m_accept_address_string[ INET6_ADDRSTRLEN ];
 
 	SSL_CTX *m_connect_ssl_ctx;
 	int m_connect_socket;
 	int m_connect_socket_flags;
+
+	struct sockaddr_storage m_sockaddr_original_dst; /* TPROXY: original destination (getsockname on accepted fd) */
+	socklen_t m_socklen_original_dst;
 
 	SSL *m_accept_ssl;
 	SSL *m_connect_ssl;
@@ -295,9 +360,24 @@ struct SSL_inspect_session_ts {
 	unsigned long long m_forward_transfer_size;
 	unsigned long long m_backward_transfer_size;
 
+	size_t m_forward_pending_offset;
+	size_t m_forward_pending_size;
+	size_t m_backward_pending_offset;
+	size_t m_backward_pending_size;
+
 	size_t m_buffer_size;
 	void *m_buffer;
 	void *m_dup_buffer; /* for dump */
+
+	/* kTLS offload and splice zero-copy relay */
+	int m_ktls_active;             /* -1=not tried, 0=inactive, 1=active */
+	int m_fwd_splice_pipe[2];      /* [0]=read [1]=write: accept(rx) → connect(tx) */
+	int m_bwd_splice_pipe[2];      /* [0]=read [1]=write: connect(rx) → accept(tx) */
+	size_t m_fwd_pipe_pending;     /* bytes in fwd pipe awaiting drain to connect */
+	size_t m_bwd_pipe_pending;     /* bytes in bwd pipe awaiting drain to accept */
+
+	SSL_CTX *m_accept_ssl_ctx;     /* per-session accept SSL_CTX (NULL = use global m_ssl_ctx) */
+	char m_sni_hostname[256];      /* SNI from ClientHello peek; empty string = no SNI */
 };
 #pragma pack(pop)
 
@@ -315,7 +395,12 @@ struct SSL_inspection_worker_context_ts {
 #if defined(def_sslid_use_dpdk_lcore)
 	unsigned int m_lcore_id;
 #endif
+#if SSL_INSPECTION_HAS_C11_ATOMICS
+	atomic_int m_running; /* for start sync up : (-1)=not-initial, 0=stopped, 1=started */
+#else
 	volatile int m_running; /* for start sync up : (-1)=not-initial, 0=stopped, 1=started */
+#endif
+	int m_thread_created; /* set to 1 after pthread_create succeeds; guards pthread_join in free_worker */
 
 	SSL_inspection_main_context_t *m_main_context;
 		
@@ -324,6 +409,8 @@ struct SSL_inspection_worker_context_ts {
 
 	SSL_inspection_session_t *m_session_queue_head; /* worker process session */
 	SSL_inspection_session_t *m_session_queue_tail; /* worker process session */
+	SSL_inspection_session_t *m_job_queue_head; /* worker ready job session */
+	SSL_inspection_session_t *m_job_queue_tail; /* worker ready job session */
 	size_t m_session_queue_count;
 
 	int m_max_epoll_events;
@@ -332,6 +419,7 @@ struct SSL_inspection_worker_context_ts {
 	struct epoll_event *m_epoll_events;
 	
 	int m_listen_socket;
+	SSL_inspection_epoll_item_t m_listen_epoll_item;
 	struct sockaddr_storage m_sockaddr_listen_bind;
 	socklen_t m_socklen_listen_bind;
 
@@ -363,6 +451,10 @@ struct SSL_inspection_main_context_ts {
 	int m_thread_model;
 	unsigned int m_max_thread_pool;
 	int m_use_ssl;
+	int m_use_ktls;   /* --ktls: kernel TLS offload (OpenSSL 3.x+, Linux 6.x+) */
+	int m_use_splice; /* --splice: zero-copy relay via splice (requires --ktls) */
+	int m_use_tproxy;             /* --tproxy: transparent proxy (iptables TPROXY rule + policy routing required) */
+	int m_connect_address_explicit; /* -B was given explicitly: enables TPROXY fallback to -B/-P on self-address */
 
 	pid_t m_pid;
 	int m_cpu_count;
@@ -398,7 +490,8 @@ struct SSL_inspection_main_context_ts {
 	const SSL_METHOD *m_server_ssl_method;
 	const SSL_METHOD *m_client_ssl_method;
 	SSL_CTX *m_ssl_ctx;
-	
+	SSL_CTX *m_client_ssl_ctx; /* shared client-side SSL_CTX, reused via SSL_new() per session */
+
 	struct sockaddr_storage m_sockaddr_connect_bind;
 	socklen_t m_socklen_connect_bind;
 	struct sockaddr_storage m_sockaddr_connect;
@@ -688,7 +781,7 @@ extern SSL_inspection_session_t *SSL_inspection_free_session_list(SSL_inspection
 extern size_t SSL_inspection_enqueue_session_list(SSL_inspection_main_context_t *s_main_context, SSL_inspection_session_t *s_session_list);
 extern size_t SSL_inspection_dequeue_session_list(SSL_inspection_main_context_t *s_main_context, size_t s_request_session_count, SSL_inspection_session_t **s_session_head_ptr, SSL_inspection_session_t **s_session_tail_ptr, int s_timeout_msec);
 
-extern SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_context, int s_is_server_side);
+extern SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_context, int s_is_server_side, const char *s_hostname);
 
 extern size_t SSL_inspection_checkout_worker_session(SSL_inspection_worker_context_t *s_worker_context, size_t s_request_session_count, int s_timeout_msec);
 

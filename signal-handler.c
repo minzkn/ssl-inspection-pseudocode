@@ -12,6 +12,7 @@
 #include "sslid-lib.h"
 
 #include <signal.h>
+#include <execinfo.h>
 
 #if defined(def_sslid_use_dpdk_lcore)
 # include <rte_lcore.h>
@@ -43,13 +44,28 @@ int SSL_inspection_is_break_main_loop(void)
 	return(*((volatile int *)(&g_SSL_inspection_break)));
 }
 
+/*
+ * Signal-safe backtrace helper.
+ * Uses only async-signal-safe functions: backtrace(), backtrace_symbols_fd(),
+ * write().  Must NOT call backtrace_symbols() (malloc) or fprintf (stdio lock).
+ */
+static void SSL_inspection_signal_safe_backtrace(void)
+{
+	void *s_bt[16];
+	int s_bt_size;
+	static const char cg_bt_hdr[] = "backtrace:\n";
+
+	s_bt_size = backtrace(s_bt, (int)(sizeof(s_bt) / sizeof(void *)));
+	(void)write(STDERR_FILENO, cg_bt_hdr, sizeof(cg_bt_hdr) - 1);
+	if (s_bt_size > 0) {
+		backtrace_symbols_fd(s_bt, s_bt_size, STDERR_FILENO);
+	}
+}
+
 static void SSL_inspection_signal_handler(int s_signo)
 {
-#if defined(def_sslid_use_dpdk_lcore)
-	(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d) (lcore=%u)\n", __func__, s_signo, rte_lcore_id());
-#else
-	(void)fprintf(stderr, def_hwport_color_normal "\n%s : Signal happened(%d)\n", __func__, s_signo);
-#endif
+	static const char cg_signal_msg[] = "\nsignal: fatal signal received\n";
+	static const char cg_quit_msg[]   = "\nsignal: quit/break requested\n";
 
 	switch(s_signo) {
 		case SIGSEGV:
@@ -68,25 +84,24 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGSYS:
 #endif
 		case SIGABRT:
+			(void)write(STDERR_FILENO, cg_signal_msg, sizeof(cg_signal_msg) - 1);
 			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
 				_exit(128 | s_signo);
 			}
 			*((volatile int *)(&g_SSL_inspection_critical)) = 1;
-			SSL_inspection_dump_backtrace();
+			SSL_inspection_signal_safe_backtrace();
 			SSL_inspection_break_main_loop();
 			_exit(128 | s_signo);
 			break;
 		case SIGQUIT: /* 강제 종료 */
 		case SIGINT: /* Ctrl + C */
 		case SIGTERM:
+			(void)write(STDERR_FILENO, cg_quit_msg, sizeof(cg_quit_msg) - 1);
 			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
 				_exit(128 | s_signo);
 			}
 			if((s_signo == SIGQUIT) || (SSL_inspection_is_break_main_loop() != 0)) {
-				if(s_signo == SIGABRT) {
-					*((volatile int *)(&g_SSL_inspection_critical)) = 1;
-				}
-				SSL_inspection_dump_backtrace();
+				SSL_inspection_signal_safe_backtrace();
 			}
 			SSL_inspection_break_main_loop();
 			if(s_signo == SIGQUIT) {
@@ -96,42 +111,49 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGHUP: /* reload */
 		case SIGPIPE: /* broken pipe ! */
 		default:
-			/* 단순 발생유무만 확인하는 부분 */
-			SSL_inspection_dump_backtrace();
 			break;
 	}
-
-	(void)signal(s_signo, SSL_inspection_signal_handler);
+	/* No signal() reinstall needed: sigaction(SA_RESTART) in install function
+	 * keeps the handler persistent without SA_RESETHAND race. */
 }
 
 int SSL_inspection_install_signal_handler(void)
 {
+	struct sigaction sa;
+
+	(void)memset((void *)(&sa), 0, sizeof(sa));
+	sa.sa_handler = SSL_inspection_signal_handler;
+	(void)sigemptyset(&sa.sa_mask);
+	/* SA_RESTART: restart interrupted syscalls automatically.
+	 * Omitting SA_RESETHAND: handler stays installed (no reinstall race). */
+	sa.sa_flags = SA_RESTART;
+
 	/* critical */
-	(void)signal(SIGSEGV, SSL_inspection_signal_handler);
-	(void)signal(SIGILL, SSL_inspection_signal_handler);
-	(void)signal(SIGABRT, SSL_inspection_signal_handler);
-	(void)signal(SIGFPE, SSL_inspection_signal_handler);
+	(void)sigaction(SIGSEGV,  &sa, (struct sigaction *)(NULL));
+	(void)sigaction(SIGILL,   &sa, (struct sigaction *)(NULL));
+	(void)sigaction(SIGABRT,  &sa, (struct sigaction *)(NULL));
+	(void)sigaction(SIGFPE,   &sa, (struct sigaction *)(NULL));
 #if defined(SIGBUS)
-	(void)signal(SIGBUS, SSL_inspection_signal_handler);
+	(void)sigaction(SIGBUS,   &sa, (struct sigaction *)(NULL));
 #endif
 #if defined(SIGSTKFLT)
-	(void)signal(SIGSTKFLT, SSL_inspection_signal_handler);
+	(void)sigaction(SIGSTKFLT, &sa, (struct sigaction *)(NULL));
 #endif
 #if defined(SIGPWR)
-	(void)signal(SIGPWR, SSL_inspection_signal_handler);
+	(void)sigaction(SIGPWR,   &sa, (struct sigaction *)(NULL));
 #endif
 #if defined(SIGSYS)
-	(void)signal(SIGSYS, SSL_inspection_signal_handler);
+	(void)sigaction(SIGSYS,   &sa, (struct sigaction *)(NULL));
 #endif
 
 	/* terminate */
-	(void)signal(SIGQUIT, SSL_inspection_signal_handler);
-	(void)signal(SIGINT, SSL_inspection_signal_handler);
-	(void)signal(SIGTERM, SSL_inspection_signal_handler);
+	(void)sigaction(SIGQUIT,  &sa, (struct sigaction *)(NULL));
+	(void)sigaction(SIGINT,   &sa, (struct sigaction *)(NULL));
+	(void)sigaction(SIGTERM,  &sa, (struct sigaction *)(NULL));
 
 	/* ignore */
-	(void)signal(SIGHUP, SSL_inspection_signal_handler);
-	(void)signal(SIGPIPE, SSL_inspection_signal_handler);
+	(void)sigaction(SIGHUP,   &sa, (struct sigaction *)(NULL));
+	(void)sigaction(SIGPIPE,  &sa, (struct sigaction *)(NULL));
 
 	return(0);
 }

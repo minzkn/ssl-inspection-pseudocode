@@ -158,7 +158,7 @@ CFLAGS_COMMON +=-I$(STAGING_DIR)/usr/include# buildroot로 빌드하는 경우
 endif
 
 ifneq ($(shell $(PKGCONF) --exists openssl && echo 0),0)
-$(warning "no installation of openssl found (PKFCONF)")
+$(warning "no installation of openssl found (PKGCONF)")
 else
 CFLAGS_COMMON += $(shell $(PKGCONF) --cflags openssl)#
 endif

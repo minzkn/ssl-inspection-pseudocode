@@ -70,7 +70,7 @@ int SSL_inspection_sha256_test0(int s_is_verbose)
 		) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 	);
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 	}
 
@@ -91,7 +91,7 @@ int SSL_inspection_sha256_test0(int s_is_verbose)
 		) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 	);
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 	}
 
@@ -145,7 +145,7 @@ int SSL_inspection_hmac_sha256_test0(int s_is_verbose)
 		) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 	);
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 	}
 
@@ -179,7 +179,7 @@ int SSL_inspection_hmac_sha256_test0(int s_is_verbose)
 			) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
 
-		if(s_is_verbose >= 1) {
+		if(s_is_verbose >= 2) {
 			(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 		}
 	}
@@ -283,7 +283,7 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 		) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 	);
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 	}
 			
@@ -317,7 +317,7 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 			) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 		);
 
-		if(s_is_verbose >= 1) {
+		if(s_is_verbose >= 2) {
 			(void)SSL_inspection_hexdump("  ", (const void *)(&s_digest_local[0]), sizeof(s_digest_local));
 		}
 	}
@@ -411,7 +411,7 @@ int SSL_inspection_pseudo_random_function_tlsv1_2_sha256_test0(int s_is_verbose)
 		) ? def_hwport_color_blue "PASSED" def_hwport_color_normal : def_hwport_color_red "FAILED" def_hwport_color_normal
 	);
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_hexdump(
 			"  ",
 			(const void *)(&s_output[0]),
@@ -529,7 +529,7 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 	c_cipher = EVP_aes_128_gcm();
 #endif
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_key0[0]), sizeof(cg_key0));
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
@@ -562,7 +562,7 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 	}
 	else {
 		(void)SSL_inspection_fprintf(stdout, "    - encrypted size : %ld\n", (long)s_process_size);
-		if(s_is_verbose >= 1) {
+		if(s_is_verbose >= 2) {
 			(void)SSL_inspection_hexdump("      [A] ", (const void *)(&cg_aad0[0]), sizeof(cg_aad0));
 			(void)SSL_inspection_hexdump("      [E] ", (const void *)(&s_ciphertext0[0]), (size_t)s_process_size);
 			(void)SSL_inspection_hexdump("      [T] ", (const void *)(&s_tag0[0]), sizeof(s_tag0));
@@ -602,7 +602,7 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 		}
 		else {
 			(void)SSL_inspection_fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
-			if(s_is_verbose >= 1) {
+			if(s_is_verbose >= 2) {
 				(void)SSL_inspection_hexdump("      [D] ", (const void *)(&s_plaintext0[0]), (size_t)s_process_size);
 			}
 			(void)SSL_inspection_fprintf(
@@ -700,7 +700,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 	s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);
 	s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_key0[0]), sizeof(cg_key0));
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
@@ -742,7 +742,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 		s_aad0[11] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) >> 8);
 		s_aad0[12] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) & ((size_t)0xffu));
 
-		if(s_is_verbose >= 1) {
+		if(s_is_verbose >= 2) {
 			(void)SSL_inspection_hexdump("      [H] ", (const void *)(&s_aad0[0]), sizeof(s_aad0));
 			(void)SSL_inspection_hexdump("      [I] ", (const void *)(&cg_iv0[0]), sizeof(cg_iv0));
 			(void)SSL_inspection_hexdump("      [E] ", (const void *)(&s_ciphertext0[0]), (size_t)s_process_size);
@@ -793,7 +793,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 		}
 		else {
 			(void)SSL_inspection_fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
-			if(s_is_verbose >= 1) {
+			if(s_is_verbose >= 2) {
 				(void)SSL_inspection_hexdump("      [D] ", (const void *)(&s_plaintext0[0]), (size_t)s_process_size);
 			}
 			(void)SSL_inspection_fprintf(
@@ -883,7 +883,7 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 	s_aad0[11] = (unsigned char)(sizeof(cg_plaintext0) >> 8);
 	s_aad0[12] = (unsigned char)(sizeof(cg_plaintext0) & ((size_t)0xffu));
 
-	if(s_is_verbose >= 1) {
+	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
 		(void)SSL_inspection_hexdump("    ", (const void *)(&cg_key0[0]), sizeof(cg_key0));
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Plain-Text (%lu bytes)\n", (unsigned long)sizeof(cg_plaintext0));
@@ -927,7 +927,7 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 		s_aad0[11] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) >> 8);
 		s_aad0[12] = (unsigned char)((sizeof(cg_plaintext0) + sizeof(cg_iv0) + sizeof(cg_icv0)) & ((size_t)0xffu));
 
-		if(s_is_verbose >= 1) {
+		if(s_is_verbose >= 2) {
 			(void)SSL_inspection_hexdump("      [H] ", (const void *)(&s_aad0[0]), sizeof(s_aad0));
 			(void)SSL_inspection_hexdump("      [I] ", (const void *)(&cg_iv0[0]), sizeof(cg_iv0));
 			(void)SSL_inspection_hexdump("      [E] ", (const void *)(&s_ciphertext0[0]), (size_t)s_process_size);
@@ -980,7 +980,7 @@ int SSL_inspection_internal_impl_test0(int s_is_verbose)
 			s_process_size = (ssize_t)sizeof(s_ciphertext0);
 
 			(void)SSL_inspection_fprintf(stdout, "    - decrypted size : %ld\n", (long)s_process_size);
-			if(s_is_verbose >= 1) {
+			if(s_is_verbose >= 2) {
 				(void)SSL_inspection_hexdump("      [D] ", (const void *)(&s_plaintext0[0]), (size_t)s_process_size);
 			}
 			(void)SSL_inspection_fprintf(
