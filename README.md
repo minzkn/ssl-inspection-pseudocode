@@ -12,6 +12,7 @@ listen port로 연결이 들어오면 connect 주소로 연결을 맺고 TLS han
 - SSL/TLS proxy (Man-in-the-Middle)
 - SNI(Server Name Indication) 자동 감지: ClientHello를 peek하여 SNI hostname을 추출하고 per-session SSL_CTX 생성
 - 자동 자체 서명 인증서 생성 (cert/key 파일 미지정 시)
+- **TLS/TCP 자동 감지 모드** (`--auto-detect-tls`): accept 즉시 upstream TCP 연결 + 클라이언트 첫 바이트 peek를 동시에 수행하여 TLS이면 SSL MITM, non-TLS이면 plain TCP relay로 자동 전환
 - AES 암/복호화 독립 구현 (AES-128/192/256, ECB/CFB8/OFB8/CBC/GCM 모드)
 - SHA256 및 HMAC-SHA256 독립 구현
 - TLS v1.2 Pseudo Random Function (PRF) 구현
@@ -29,7 +30,7 @@ listen port로 연결이 들어오면 connect 주소로 연결을 맺고 TLS han
 
 ```
 ssl-inspection-pseudocode/
-├── main.c               # 메인 소스 (thread-pool, epoll, async, SNI, TPROXY)
+├── main.c               # 메인 소스 (thread-pool, epoll, async, SNI, TPROXY, auto-detect)
 ├── sslid-lib.c          # SSL inspection 라이브러리 (유틸리티, 소켓 헬퍼)
 ├── aes.c                # AES 암/복호화 구현 (ECB/CFB8/OFB8/CBC)
 ├── aes-gcm.c            # AES-GCM 구현
@@ -83,6 +84,50 @@ make -j$(nproc) DEF_ENABLE_TEST_VECTOR=no CROSS_COMPILE=aarch64-linux-gnu-
 # 8443 포트로 수신하여 1.0.0.1:443으로 SSL inspection 중계
 ./sslid -p 8443 -B 1.0.0.1 -P 443
 ```
+
+### TLS/TCP 자동 감지 모드 (--auto-detect-tls)
+
+클라이언트가 TLS를 사용하는지 여부를 연결 수립 시 자동으로 판단합니다.
+
+- **TLS 감지** → SSL MITM inspection 수행 (기존 동작과 동일)
+- **non-TLS 감지** → plain TCP relay로 자동 전환
+- **타임아웃** → 지정 시간 내 클라이언트 데이터가 오지 않으면 TCP relay 전환
+  (SMTP/IMAP/POP3 등 서버가 먼저 말하는 프로토콜 대응)
+
+```bash
+# 기본 (peek timeout 3000ms)
+./sslid -p 8443 -B 1.0.0.1 -P 443 --auto-detect-tls
+
+# timeout 조정 (1초)
+./sslid -p 8443 -B 1.0.0.1 -P 443 --auto-detect-tls --peek-timeout=1000
+
+# TPROXY와 함께 사용
+sudo ./sslid --tproxy -p 8443 -B 1.0.0.1 -P 443 --auto-detect-tls -v
+```
+
+#### 동작 원리 (Approach B: connect-then-peek)
+
+```
+Client accept
+    │
+    ├─── upstream TCP connect 시작 (비동기, 동시)
+    │
+    └─── client 첫 바이트 peek (MSG_PEEK)
+              │
+              ├─ TLS ClientHello 감지
+              │       │
+              │       └─ SSL MITM: per-SNI 인증서 생성 → SSL_accept / SSL_connect
+              │
+              ├─ non-TLS 데이터 감지
+              │       │
+              │       └─ TCP relay: 서버 배너(버퍼링된 경우) 포함 양방향 중계
+              │
+              └─ peek timeout (서버 선행 프로토콜 대응)
+                      │
+                      └─ TCP relay: 서버 배너 → 클라이언트 전달 후 양방향 중계
+```
+
+> **주의:** `--auto-detect-tls`와 `--nossl`은 함께 사용할 수 없습니다.
 
 ### TPROXY 투명 프록시 모드
 
@@ -139,7 +184,7 @@ sudo ./sslid --tproxy -p 8443 -B 1.0.0.1 -P 443 -v
 -P, --connect-port=<port>   연결 대상 포트 (기본: 443)
     --buffer-size=<bytes>   레코드 버퍼 크기 (기본: 16384, TLS 최대 레코드 크기)
 -n, --no-thread             단일 worker 모드 (스레드 없음)
-    --thread-pool=<count>   Worker 스레드 수 (기본: CPU 개수)
+    --thread-pool=<count>   Worker 스레드 수 (기본: CPU 개수, 최대: 4096)
     --serialize-lock        SSL handshake 직렬화 잠금 사용
 -a, --async                 OpenSSL ASYNC 모드 사용
     --nossl                 TCP proxy 모드 (SSL passthrough, TLS 처리 없음)
@@ -147,6 +192,13 @@ sudo ./sslid --tproxy -p 8443 -B 1.0.0.1 -P 443 -v
     --splice                splice(2) zero-copy 중계 (--ktls 자동 활성화, OpenSSL 3.x+)
     --tproxy                투명 프록시 모드: accepted socket의 original dst 사용
                             (CAP_NET_ADMIN 필요, iptables TPROXY rule 및 policy routing 필요)
+    --auto-detect-tls       연결별 TLS/TCP 자동 감지: accept 즉시 upstream TCP connect를
+                            시작하고 동시에 클라이언트 첫 바이트를 peek하여 TLS이면 SSL
+                            MITM, non-TLS이면 plain TCP relay로 자동 전환.
+                            --nossl 과 함께 사용 불가.
+    --peek-timeout=<ms>     --auto-detect-tls 사용 시 클라이언트 데이터 대기 최대 시간
+                            (기본: 3000ms, 최대: 3600000ms).
+                            타임아웃 시 TCP relay로 전환 (서버 선행 프로토콜 대응).
 ```
 
 ## 요구사항
