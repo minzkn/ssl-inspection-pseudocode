@@ -275,6 +275,7 @@ typedef struct SSL_inspection_async_wait_ts __SSL_inspection_async_wait_t;
 #define def_SSL_inspection_session_flag_ssl_accepted (1u << 2) /* SSL_accept 유효 상태 */
 #define def_SSL_inspection_session_flag_ssl_connected (1u << 3) /* SSL_connect 유효 상태 */
 #define def_SSL_inspection_session_flag_tproxy_no_spoof (1u << 4) /* TPROXY fallback 적용: connect 소켓 소스 스푸핑 생략 */
+#define def_SSL_inspection_session_flag_tcp_relay (1u << 5) /* --auto-detect-tls: non-TLS 확정 → plain TCP relay */
 
 #define def_SSL_inspection_session_state_none 0u
 #define def_SSL_inspection_session_state_connecting 1u
@@ -283,6 +284,18 @@ typedef struct SSL_inspection_async_wait_ts __SSL_inspection_async_wait_t;
 #define def_SSL_inspection_session_state_stream 4u
 #define def_SSL_inspection_session_state_closing 5u
 #define def_SSL_inspection_session_state_peek_client_hello 6u
+#define def_SSL_inspection_session_state_auto_detect 7u /* --auto-detect-tls: accept 즉시 서버 TCP connect + 동시 client peek */
+
+/* --auto-detect-tls: 프로토콜 감지 결과 */
+#define def_SSL_inspection_auto_detect_unknown 0u /* 아직 미결 */
+#define def_SSL_inspection_auto_detect_tls     1u /* TLS ClientHello 확인 → SSL MITM */
+#define def_SSL_inspection_auto_detect_tcp     2u /* non-TLS 데이터 → TCP relay */
+#define def_SSL_inspection_auto_detect_timeout 3u /* peek 타임아웃 → TCP relay */
+#define def_SSL_inspection_auto_detect_quic    4u /* QUIC 예약 (미래 UDP 경로 전용) */
+
+/* transport 구분 (QUIC 미래 대비) */
+#define def_SSL_inspection_transport_tcp 0u /* 현재 */
+#define def_SSL_inspection_transport_udp 1u /* 미래 QUIC */
 
 #define def_SSL_inspection_session_job_flag_none 0u
 #define def_SSL_inspection_session_job_flag_enqueued (1u << 0)
@@ -378,6 +391,11 @@ struct SSL_inspect_session_ts {
 
 	SSL_CTX *m_accept_ssl_ctx;     /* per-session accept SSL_CTX (NULL = use global m_ssl_ctx) */
 	char m_sni_hostname[256];      /* SNI from ClientHello peek; empty string = no SNI */
+
+	/* --auto-detect-tls */
+	unsigned int m_auto_detect_result; /* def_SSL_inspection_auto_detect_xxx */
+	uint64_t     m_peek_start_ts;      /* peek 시작 시각 ms (CLOCK_MONOTONIC 기반) */
+	unsigned int m_transport;          /* def_SSL_inspection_transport_xxx (QUIC 미래 대비) */
 };
 #pragma pack(pop)
 
@@ -455,6 +473,8 @@ struct SSL_inspection_main_context_ts {
 	int m_use_splice; /* --splice: zero-copy relay via splice (requires --ktls) */
 	int m_use_tproxy;             /* --tproxy: transparent proxy (iptables TPROXY rule + policy routing required) */
 	int m_connect_address_explicit; /* -B was given explicitly: enables TPROXY fallback to -B/-P on self-address */
+	int m_use_auto_detect_tls;   /* --auto-detect-tls: 연결별 TLS/TCP 자동 감지 */
+	int m_peek_timeout_ms;       /* --peek-timeout: 서버 선행 프로토콜 폴백 타임아웃 ms (기본 3000) */
 
 	pid_t m_pid;
 	int m_cpu_count;

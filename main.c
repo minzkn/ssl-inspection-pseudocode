@@ -43,6 +43,7 @@ int SSL_inspection_session_update_epoll(SSL_inspection_session_t *s_session);
 void SSL_inspection_session_clear_async_wait(SSL_inspection_session_t *s_session, SSL_inspection_async_wait_t *s_async_wait);
 int SSL_inspection_session_refresh_async_wait(SSL_inspection_session_t *s_session, SSL *s_ssl, SSL_inspection_async_wait_t *s_async_wait, unsigned int s_epoll_item_type);
 int SSL_inspection_session_ensure_ssl(SSL_inspection_session_t *s_session, int s_is_accept_side);
+static int SSL_inspection_session_poll_connect(SSL_inspection_session_t *s_session);
 int SSL_inspection_session_drive_connect(SSL_inspection_session_t *s_session);
 int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, int s_is_accept_side);
 ssize_t SSL_inspection_session_recv_nonblock(SSL_inspection_session_t *s_session, int s_is_accept_side, void *s_buffer, size_t s_buffer_size);
@@ -104,6 +105,9 @@ SSL_inspection_session_t *SSL_inspection_new_and_accept_session(SSL_inspection_m
 		.m_bwd_pipe_pending = (size_t)0u,
 		.m_accept_ssl_ctx = NULL,
 		.m_sni_hostname = {0},
+		.m_auto_detect_result = def_SSL_inspection_auto_detect_unknown,
+		.m_peek_start_ts = (uint64_t)0u,
+		.m_transport = def_SSL_inspection_transport_tcp,
 	};
 
 	/* do accept: accept4 sets SOCK_NONBLOCK|SOCK_CLOEXEC atomically, saving 2 fcntl syscalls */
@@ -400,12 +404,19 @@ size_t SSL_inspection_dequeue_session_list(SSL_inspection_main_context_t *s_main
 					s_timespec.tv_sec++;
 					s_timespec.tv_nsec -= 1000000000L;
 				}
-
-				(void)pthread_cond_timedwait((pthread_cond_t *)(&s_main_context->m_session_queue_cond), (pthread_mutex_t *)(&s_main_context->m_session_queue_lock), (const struct timespec *)(&s_timespec));
+				/* spurious wakeup 방지: queue가 실제로 비어 있는 동안만 대기 */
+				while(s_main_context->m_session_queue_head == ((SSL_inspection_session_t *)(NULL))) {
+					if(pthread_cond_timedwait((pthread_cond_t *)(&s_main_context->m_session_queue_cond), (pthread_mutex_t *)(&s_main_context->m_session_queue_lock), (const struct timespec *)(&s_timespec)) == ETIMEDOUT) {
+						break;
+					}
+				}
 			}
 		}
 		else { /* wait for enqueue */
-			(void)pthread_cond_wait((pthread_cond_t *)(&s_main_context->m_session_queue_cond), (pthread_mutex_t *)(&s_main_context->m_session_queue_lock));
+			/* spurious wakeup 방지: queue가 실제로 비어 있는 동안만 대기 */
+			while(s_main_context->m_session_queue_head == ((SSL_inspection_session_t *)(NULL))) {
+				(void)pthread_cond_wait((pthread_cond_t *)(&s_main_context->m_session_queue_cond), (pthread_mutex_t *)(&s_main_context->m_session_queue_lock));
+			}
 		}
 	}
 
@@ -479,9 +490,6 @@ size_t SSL_inspection_dequeue_session_list(SSL_inspection_main_context_t *s_main
 			(void)SSL_inspection_fprintf(stderr, "BUG: memory leak s_session_head[%p] != s_session_tail[%p]\n", s_session_head, s_session_tail);
 			/* dequeued cleanup session */
 			s_session_head = s_session_tail = SSL_inspection_free_session_list(s_session_head);
-			if(s_session_head_ptr != ((SSL_inspection_session_t **)(NULL))) {
-				*s_session_head_ptr = s_session_head;
-			}
 			s_session_dequeued_count = (size_t)0u;
 		}
 		*s_session_tail_ptr = s_session_tail;
@@ -557,7 +565,7 @@ static int SSL_inspection_sni_is_loopback(const char *s_sni)
 
 static int SSL_inspection_session_peek_sni(SSL_inspection_session_t *s_session)
 {
-	unsigned char s_buf[1024];
+	unsigned char s_buf[4096]; /* TLS 1.3 ClientHello는 GREASE/key_share 포함 시 1 KB 초과 가능 */
 	ssize_t s_n;
 	size_t s_pos, s_ext_end, s_type, s_len;
 
@@ -570,13 +578,13 @@ static int SSL_inspection_session_peek_sni(SSL_inspection_session_t *s_session)
 	}
 
 	/* TLS record header: [0]=0x16(Handshake) [1]=0x03(major) */
-	if((size_t)s_n < 5u) return(((size_t)s_n < sizeof(s_buf)) ? 0 : 1); /* 부분 도착 — 더 기다리거나 non-TLS */
-	if((s_buf[0] != 0x16u) || (s_buf[1] != 0x03u)) return(1); /* not TLS — proceed without SNI */
+	if((size_t)s_n < 5u) return(0); /* 부분 도착 — 더 기다림 */
+	if((s_buf[0] != 0x16u) || (s_buf[1] != 0x03u)) return(2); /* not TLS */
 	/* Handshake msg: [5]=0x01 (ClientHello) */
-	if((size_t)s_n < 9u) return(((size_t)s_n < sizeof(s_buf)) ? 0 : 1);
-	if(s_buf[5] != 0x01u) return(1); /* not ClientHello */
+	if((size_t)s_n < 9u) return(0);
+	if(s_buf[5] != 0x01u) return(2); /* Alert/CCS 등 non-ClientHello → TCP relay */
 	/* ClientHello fixed header ends at byte 43 (before session_id length) */
-	if((size_t)s_n < 44u) return(((size_t)s_n < sizeof(s_buf)) ? 0 : 1);
+	if((size_t)s_n < 44u) return(0);
 
 	s_pos = 43u;
 	/* skip session_id */
@@ -589,7 +597,7 @@ static int SSL_inspection_session_peek_sni(SSL_inspection_session_t *s_session)
 	if(s_pos + 1u > (size_t)s_n) return(((size_t)s_n < sizeof(s_buf)) ? 0 : 1);
 	s_pos += 1u + (size_t)s_buf[s_pos];
 	/* extensions length */
-	if(s_pos + 2u > (size_t)s_n) return(1); /* no extensions — proceed without SNI */
+	if(s_pos + 2u > (size_t)s_n) return(((size_t)s_n < sizeof(s_buf)) ? 0 : 1); /* no extensions — proceed without SNI */
 	s_ext_end = s_pos + 2u + (((size_t)s_buf[s_pos] << 8) | (size_t)s_buf[s_pos + 1u]);
 	s_pos += 2u;
 	if(s_ext_end > (size_t)s_n) s_ext_end = (size_t)s_n;
@@ -1558,11 +1566,34 @@ int SSL_inspection_session_ensure_ssl(SSL_inspection_session_t *s_session, int s
 	return(1);
 }
 
+/* connect 완료 여부만 확인 — 상태(m_state) 변경 없음.
+ * drive_connect()와 auto_detect 핸들러가 공유하는 헬퍼. */
+static int SSL_inspection_session_poll_connect(SSL_inspection_session_t *s_session)
+{
+	int s_sockerr;
+	socklen_t s_sockerr_size;
+	int s_check;
+
+	if((s_session->m_flags & def_SSL_inspection_session_flag_connected) != 0)
+		return(1); /* 이미 완료 */
+
+	if((s_session->m_connect_ready_events & (EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) == 0u)
+		return(0); /* 이벤트 없음 */
+
+	s_sockerr = 0;
+	s_sockerr_size = (socklen_t)sizeof(s_sockerr);
+	s_check = getsockopt(s_session->m_connect_socket, SOL_SOCKET, SO_ERROR,
+	                     (void *)(&s_sockerr), (socklen_t *)(&s_sockerr_size));
+	if(SSL_inspection_unlikely(s_check == (-1))) return(-1);
+	if(s_sockerr != 0) { errno = s_sockerr; return(-1); }
+
+	s_session->m_flags |= def_SSL_inspection_session_flag_connected;
+	return(1);
+}
+
 int SSL_inspection_session_drive_connect(SSL_inspection_session_t *s_session)
 {
 	SSL_inspection_main_context_t *s_main_context;
-	socklen_t s_sockerr_size;
-	int s_sockerr;
 	int s_check;
 
 	if(s_session == ((SSL_inspection_session_t *)(NULL))) {
@@ -1576,23 +1607,11 @@ int SSL_inspection_session_drive_connect(SSL_inspection_session_t *s_session)
 	if(s_session->m_state != def_SSL_inspection_session_state_connecting) {
 		return(0);
 	}
-	if((s_session->m_connect_ready_events & (EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) == 0u) {
-		return(0);
-	}
+
+	s_check = SSL_inspection_session_poll_connect(s_session);
+	if(s_check != 1) return(s_check);
 
 	s_main_context = s_session->m_main_context;
-	s_sockerr = 0;
-	s_sockerr_size = (socklen_t)sizeof(s_sockerr);
-	s_check = getsockopt(s_session->m_connect_socket, SOL_SOCKET, SO_ERROR, (void *)(&s_sockerr), (socklen_t *)(&s_sockerr_size));
-	if(SSL_inspection_unlikely(s_check == (-1))) {
-		return(-1);
-	}
-	if(s_sockerr != 0) {
-		errno = s_sockerr;
-		return(-1);
-	}
-
-	s_session->m_flags |= def_SSL_inspection_session_flag_connected;
 	s_session->m_state = (s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? def_SSL_inspection_session_state_stream : def_SSL_inspection_session_state_connect_ssl_handshake;
 
 	if(s_main_context->m_is_verbose >= 1) {
@@ -1667,7 +1686,11 @@ int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, 
 		s_async_wait = (SSL_inspection_async_wait_t *)(&s_session->m_connect_async_wait);
 		s_ssl = s_session->m_connect_ssl;
 		s_done_flag = def_SSL_inspection_session_flag_ssl_connected;
-		s_state_done = (s_main_context->m_ssl_ctx == ((SSL_CTX *)(NULL))) ? def_SSL_inspection_session_state_stream : def_SSL_inspection_session_state_accept_ssl_handshake;
+		/* accept-side SSL handshake가 필요한 경우: SSL inspection 모드이면서 TCP relay가 아닌 세션 */
+		s_state_done = ((s_main_context->m_ssl_ctx == ((SSL_CTX *)(NULL))) ||
+		                ((s_session->m_flags & def_SSL_inspection_session_flag_tcp_relay) != 0))
+		    ? def_SSL_inspection_session_state_stream
+		    : def_SSL_inspection_session_state_accept_ssl_handshake;
 		s_epoll_item_type = def_SSL_inspection_epoll_item_type_connect_async;
 	}
 
@@ -1786,7 +1809,7 @@ int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, 
 		errno = ECONNRESET;
 		return(-1);
 	}
-	if((s_ssl_error == SSL_ERROR_SYSCALL) && ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno == EINTR) || (errno == EINPROGRESS))) {
+	if((s_ssl_error == SSL_ERROR_SYSCALL) && ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno == EINTR))) {
 		errno = EAGAIN;
 		return(0);
 	}
@@ -1838,6 +1861,12 @@ ssize_t SSL_inspection_session_recv_nonblock(SSL_inspection_session_t *s_session
 		return((ssize_t)s_check);
 	}
 	if(s_check == 0) {
+		s_ssl_error = SSL_get_error(s_ssl, 0);
+		if(s_ssl_error != SSL_ERROR_ZERO_RETURN && s_ssl_error != SSL_ERROR_NONE) {
+			(void)SSL_inspection_fprintf(stderr,
+				"SSL_read=0 non-clean close: SSL_get_error=%d (%s, fd=%d)\n",
+				s_ssl_error, (s_is_accept_side != 0) ? "accept" : "connect", s_socket);
+		}
 		return((ssize_t)0);
 	}
 
@@ -2000,13 +2029,6 @@ int SSL_inspection_session_flush_buffer(SSL_inspection_session_t *s_session, int
 				((s_to_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL"
 			);
 
-			if(s_to_accept_side != 0) {
-				s_session->m_flags &= (~(def_SSL_inspection_session_flag_accepted | def_SSL_inspection_session_flag_ssl_accepted));
-			}
-			else {
-				s_session->m_flags &= (~(def_SSL_inspection_session_flag_connected | def_SSL_inspection_session_flag_ssl_connected));
-			}
-
 			return(-1);
 		}
 
@@ -2091,13 +2113,6 @@ int SSL_inspection_session_fill_buffer(SSL_inspection_session_t *s_session, int 
 			((s_from_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL"
 		);
 
-		if(s_from_accept_side != 0) {
-			s_session->m_flags &= (~(def_SSL_inspection_session_flag_accepted | def_SSL_inspection_session_flag_ssl_accepted));
-		}
-		else {
-			s_session->m_flags &= (~(def_SSL_inspection_session_flag_connected | def_SSL_inspection_session_flag_ssl_connected));
-		}
-
 		return(-1);
 	}
 	if(s_recv_bytes == ((ssize_t)0)) {
@@ -2126,12 +2141,6 @@ int SSL_inspection_session_fill_buffer(SSL_inspection_session_t *s_session, int 
 			}
 		}
 
-		if(s_from_accept_side != 0) {
-			s_session->m_flags &= (~(def_SSL_inspection_session_flag_accepted | def_SSL_inspection_session_flag_ssl_accepted));
-		}
-		else {
-			s_session->m_flags &= (~(def_SSL_inspection_session_flag_connected | def_SSL_inspection_session_flag_ssl_connected));
-		}
 		errno = ECONNRESET;
 		return(-1);
 	}
@@ -2171,7 +2180,15 @@ int SSL_inspection_session_update_epoll(SSL_inspection_session_t *s_session)
 	s_accept_events = 0u;
 	if(s_session->m_accept_socket != (-1)) {
 		s_accept_events = def_SSL_inspection_epoll_session_base_events;
-		if((s_session->m_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) && ((s_session->m_flags & def_SSL_inspection_session_flag_ssl_accepted) == def_SSL_inspection_session_flag_none)) {
+		if(s_session->m_state == def_SSL_inspection_session_state_auto_detect) {
+			/* 감지 미결 시에만 EPOLLIN 등록: 감지 완료 후 connect 대기 중 level-triggered busy-loop 방지 */
+			if(s_session->m_auto_detect_result == def_SSL_inspection_auto_detect_unknown) {
+				s_accept_events |= (uint32_t)EPOLLIN;
+			}
+		}
+		else if((s_session->m_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) &&
+		        ((s_session->m_flags & def_SSL_inspection_session_flag_tcp_relay) == 0) &&
+		        ((s_session->m_flags & def_SSL_inspection_session_flag_ssl_accepted) == def_SSL_inspection_session_flag_none)) {
 			/* MSG_PEEK 후 ClientHello가 소켓 버퍼에 남아 있으므로 connecting/connect_ssl_handshake
 			 * 구간에서는 EPOLLIN 등록을 생략한다 — level-triggered busy-loop 방지.
 			 * peek 단계와 accept SSL 핸드쉐이크 단계에서만 EPOLLIN을 등록한다. */
@@ -2220,7 +2237,19 @@ int SSL_inspection_session_update_epoll(SSL_inspection_session_t *s_session)
 	s_connect_events = 0u;
 	if(s_session->m_connect_socket != (-1)) {
 		s_connect_events = def_SSL_inspection_epoll_session_base_events;
-		if((s_session->m_flags & def_SSL_inspection_session_flag_connected) == def_SSL_inspection_session_flag_none) {
+		if(s_session->m_state == def_SSL_inspection_session_state_auto_detect) {
+			if((s_session->m_flags & def_SSL_inspection_session_flag_connected) == 0) {
+				/* connect 완료 대기 */
+				s_connect_events |= (uint32_t)EPOLLOUT;
+			}
+			else if(s_session->m_auto_detect_result == def_SSL_inspection_auto_detect_unknown &&
+			        s_session->m_backward_pending_size == 0u) {
+				/* 서버 선행 데이터 수신 대기 */
+				s_connect_events |= (uint32_t)EPOLLIN;
+			}
+			/* detect 완료 or backward buf 찬 경우: connect 이벤트 불필요 */
+		}
+		else if((s_session->m_flags & def_SSL_inspection_session_flag_connected) == def_SSL_inspection_session_flag_none) {
 			s_connect_events |= (uint32_t)EPOLLOUT;
 		}
 		else if((s_session->m_connect_ssl_ctx != ((SSL_CTX *)(NULL))) && ((s_session->m_flags & def_SSL_inspection_session_flag_ssl_connected) == def_SSL_inspection_session_flag_none)) {
@@ -2317,9 +2346,18 @@ int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_work
 
 	s_main_context = s_worker_context->m_main_context;
 	s_session->m_worker_context = s_worker_context;
-	s_session->m_state = (s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL)))
-		? def_SSL_inspection_session_state_peek_client_hello
-		: def_SSL_inspection_session_state_connecting;
+	if(s_main_context->m_use_auto_detect_tls != 0) {
+		/* B 방안: accept 즉시 서버 TCP 연결 + 동시에 클라이언트 peek */
+		s_session->m_state = def_SSL_inspection_session_state_auto_detect;
+	}
+	else if(s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) {
+		/* 기존 SSL 모드: peek 후 연결 */
+		s_session->m_state = def_SSL_inspection_session_state_peek_client_hello;
+	}
+	else {
+		/* 기존 TCP 모드: 즉시 연결 */
+		s_session->m_state = def_SSL_inspection_session_state_connecting;
+	}
 	s_session->m_job_flags = def_SSL_inspection_session_job_flag_none;
 	s_session->m_job_next = (SSL_inspection_session_t *)(NULL);
 	s_session->m_forward_pending_offset = s_session->m_forward_pending_size = (size_t)0u;
@@ -2458,7 +2496,10 @@ int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_work
 	}
 #endif
 
-	if(s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) {
+	if((s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) &&
+	   (s_main_context->m_use_auto_detect_tls == 0) &&
+	   ((s_session->m_flags & def_SSL_inspection_session_flag_tcp_relay) == 0)) {
+		/* auto_detect 모드: m_connect_ssl_ctx는 TLS 확정 후 drive()에서 설정 */
 		s_session->m_connect_ssl_ctx = s_main_context->m_client_ssl_ctx;
 		if(SSL_inspection_unlikely(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL)))) {
 			(void)SSL_inspection_fprintf(stderr, "client SSL_CTX not initialized ! (connect)\n");
@@ -2484,13 +2525,26 @@ int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_work
 		.m_is_registered = 0,
 	};
 
-	if(s_main_context->m_ssl_ctx == ((SSL_CTX *)(NULL))) {
+	if(s_main_context->m_use_auto_detect_tls != 0) {
+		/* auto_detect: 서버 TCP 연결 즉시 시작 (SSL CTX 할당은 TLS 확정 후 drive()에서 수행) */
+		s_session->m_auto_detect_result = def_SSL_inspection_auto_detect_unknown;
+		s_session->m_peek_start_ts      = SSL_inspection_get_time_stamp_msec();
+		if(SSL_inspection_unlikely(SSL_inspection_session_initiate_connect(s_session) != 0)) {
+			return(-1);
+		}
+		/* initiate_connect()가 변경할 수 있는 state를 auto_detect로 복원 */
+		s_session->m_state = def_SSL_inspection_session_state_auto_detect;
+	}
+	else if(s_main_context->m_ssl_ctx == ((SSL_CTX *)(NULL))) {
 		/* TCP mode: no SNI peek needed — connect immediately */
 		if(SSL_inspection_unlikely(SSL_inspection_session_initiate_connect(s_session) != 0)) {
 			return(-1);
 		}
 	}
-
+	else {
+		/* peek_client_hello 모드: 타임아웃 추적을 위해 시작 시각 기록 */
+		s_session->m_peek_start_ts = SSL_inspection_get_time_stamp_msec();
+	}
 	if(SSL_inspection_unlikely(SSL_inspection_session_update_epoll(s_session) != 0)) {
 		return(-1);
 	}
@@ -2788,8 +2842,22 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 			s_progress = 1;
 		}
 		else if(s_n == (ssize_t)0) {
-			/* M-2: accept side FIN; pipe was empty when FIN arrived (m_fwd_pipe_pending == 0
-			 * is the entry condition for this block), so there is nothing to drain. */
+			/* accept side FIN: fwd_pipe(client→server)는 비어 있지만(진입 조건),
+			 * bwd_pipe(server→client)에 남아 있는 데이터는 클라이언트에 전달하고 종료. */
+			while(s_session->m_bwd_pipe_pending > (size_t)0u) {
+				ssize_t s_drained = splice(
+					s_session->m_bwd_splice_pipe[0], (loff_t *)(NULL),
+					s_session->m_accept_socket, (loff_t *)(NULL),
+					s_session->m_bwd_pipe_pending,
+					SPLICE_F_NONBLOCK | SPLICE_F_MOVE
+				);
+				if(s_drained > (ssize_t)0) {
+					s_session->m_bwd_pipe_pending -= (size_t)s_drained;
+				}
+				else {
+					break; /* EAGAIN 또는 에러 — best-effort drain */
+				}
+			}
 			return(-1);
 		}
 		else if((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR)) {
@@ -2835,8 +2903,22 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 			s_progress = 1;
 		}
 		else if(s_n == (ssize_t)0) {
-			/* M-1: connect side FIN; pipe was empty when FIN arrived (m_bwd_pipe_pending == 0
-			 * is the entry condition for this block), so there is nothing to drain. */
+			/* connect side FIN: bwd_pipe(server→client)는 비어 있지만(진입 조건),
+			 * fwd_pipe(client→server)에 남아 있는 데이터는 서버에 전달하고 종료. */
+			while(s_session->m_fwd_pipe_pending > (size_t)0u) {
+				ssize_t s_drained = splice(
+					s_session->m_fwd_splice_pipe[0], (loff_t *)(NULL),
+					s_session->m_connect_socket, (loff_t *)(NULL),
+					s_session->m_fwd_pipe_pending,
+					SPLICE_F_NONBLOCK | SPLICE_F_MOVE
+				);
+				if(s_drained > (ssize_t)0) {
+					s_session->m_fwd_pipe_pending -= (size_t)s_drained;
+				}
+				else {
+					break;
+				}
+			}
 			return(-1);
 		}
 		else if((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR)) {
@@ -2893,10 +2975,193 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 	for(s_loop = 0;s_loop < 16;s_loop++) {
 		s_progress = 0;
 
+		/* ── auto_detect 상태: accept 즉시 서버 TCP connect + 동시 client peek ── */
+		if(s_session->m_state == def_SSL_inspection_session_state_auto_detect) {
+
+			/* 단계 1: connect 완료 확인 */
+			if((s_session->m_flags & def_SSL_inspection_session_flag_connected) == 0) {
+				s_check = SSL_inspection_session_poll_connect(s_session);
+				if(SSL_inspection_unlikely(s_check == (-1))) return(-1);
+				if(s_check > 0) {
+					if(s_main_context->m_is_verbose >= 1) {
+						(void)SSL_inspection_fprintf(stdout,
+							"auto-detect: server connected (connect_fd=%d, accept_fd=%d)\n",
+							s_session->m_connect_socket, s_session->m_accept_socket);
+					}
+					s_progress = 1;
+				}
+			}
+
+			/* 단계 2: 서버 선행 데이터 버퍼링 (connect 완료 후, detect 미결 상태에서만) */
+			if((s_session->m_flags & def_SSL_inspection_session_flag_connected) != 0 &&
+			   s_session->m_auto_detect_result == def_SSL_inspection_auto_detect_unknown &&
+			   (s_session->m_connect_ready_events & EPOLLIN) != 0 &&
+			   s_session->m_backward_pending_size == 0u) {
+				ssize_t s_n = recv(s_session->m_connect_socket,
+				                   s_session->m_dup_buffer,
+				                   s_session->m_buffer_size,
+				                   MSG_DONTWAIT);
+				if(s_n > 0) {
+					s_session->m_backward_pending_size   = (size_t)s_n;
+					s_session->m_backward_pending_offset = 0u;
+					if(s_main_context->m_is_verbose >= 1) {
+						(void)SSL_inspection_fprintf(stdout,
+							"auto-detect: server banner buffered (%zd bytes, connect_fd=%d)\n",
+							s_n, s_session->m_connect_socket);
+					}
+					s_progress = 1;
+				}
+				else if(s_n == 0 ||
+				        ((s_n < 0) && (errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR))) {
+					return(-1);
+				}
+			}
+
+
+			/* 단계 3: 클라이언트 프로토콜 감지 (peek)
+			 * 단계 2b보다 먼저 실행: 서버 FIN과 클라이언트 TLS가 같은 epoll 사이클에 도착할 때
+			 * TLS를 우선 감지해야 하므로 순서가 중요하다. */
+			if(s_session->m_auto_detect_result == def_SSL_inspection_auto_detect_unknown) {
+				s_check = SSL_inspection_session_peek_sni(s_session);
+				if(SSL_inspection_unlikely(s_check < 0)) return(-1);
+
+				if(s_check == 0) {
+					/* 데이터 없음: 타임아웃 확인 */
+					uint64_t s_elapsed = SSL_inspection_get_time_stamp_msec() - s_session->m_peek_start_ts;
+					if(s_elapsed >= (uint64_t)s_main_context->m_peek_timeout_ms) {
+						s_session->m_auto_detect_result = def_SSL_inspection_auto_detect_timeout;
+						s_session->m_flags |= def_SSL_inspection_session_flag_tcp_relay;
+						if(s_main_context->m_is_verbose >= 1) {
+							(void)SSL_inspection_fprintf(stdout,
+								"auto-detect: peek timeout → TCP relay (fd=%d)\n",
+								s_session->m_accept_socket);
+						}
+						s_progress = 1;
+					}
+					/* else: EPOLLIN 대기 */
+				}
+				else if(s_check == 1) {
+					/* TLS ClientHello 확정 */
+					s_session->m_auto_detect_result = def_SSL_inspection_auto_detect_tls;
+
+					/* backward 버퍼 초기화: TLS 서버는 ClientHello 수신 전 무송신이 정상.
+					 * 비정상 서버가 데이터를 보냈더라도 SSL_connect로 새 핸드셰이크 시작. */
+					if(s_session->m_backward_pending_size > 0u) {
+						(void)SSL_inspection_fprintf(stderr,
+							"auto-detect: TLS detected — discarding %zu pre-handshake server bytes (fd=%d)\n",
+							s_session->m_backward_pending_size, s_session->m_accept_socket);
+						s_session->m_backward_pending_size   = 0u;
+						s_session->m_backward_pending_offset = 0u;
+					}
+
+					/* connect SSL ctx 지금 설정 (initiate_connect에서 미뤄둔 것) */
+					s_session->m_connect_ssl_ctx = s_main_context->m_client_ssl_ctx;
+					if(SSL_inspection_unlikely(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL)))) {
+						(void)SSL_inspection_fprintf(stderr,
+							"auto-detect: client SSL_CTX not initialized !\n");
+						return(-1);
+					}
+
+					/* SNI loopback 무시 */
+					if((s_session->m_sni_hostname[0] != '\0') &&
+					   SSL_inspection_unlikely(SSL_inspection_sni_is_loopback(s_session->m_sni_hostname) != 0)) {
+						if(s_main_context->m_is_verbose >= 1) {
+							(void)SSL_inspection_fprintf(stderr,
+								"auto-detect: SNI loopback ignored: \"%s\" (fd=%d)\n",
+								s_session->m_sni_hostname, s_session->m_accept_socket);
+						}
+						s_session->m_sni_hostname[0] = '\0';
+					}
+
+					/* per-SNI 인증서 생성 */
+					if((s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) &&
+					   (s_session->m_sni_hostname[0] != '\0')) {
+						if(s_main_context->m_is_verbose >= 1) {
+							(void)SSL_inspection_fprintf(stdout,
+								"auto-detect: TLS, sni=\"%s\" → per-session cert (fd=%d)\n",
+								s_session->m_sni_hostname, s_session->m_accept_socket);
+						}
+						s_session->m_accept_ssl_ctx = SSL_inspection_new_SSL_CTX(
+							s_main_context, 1, s_session->m_sni_hostname);
+						if(SSL_inspection_unlikely(s_session->m_accept_ssl_ctx == ((SSL_CTX *)(NULL)))) return(-1);
+					}
+					else if(s_main_context->m_is_verbose >= 1) {
+						(void)SSL_inspection_fprintf(stdout,
+							"auto-detect: TLS, no SNI → global cert (fd=%d)\n",
+							s_session->m_accept_socket);
+					}
+					s_progress = 1;
+				}
+				else { /* s_check == 2: non-TLS */
+					s_session->m_auto_detect_result = def_SSL_inspection_auto_detect_tcp;
+					s_session->m_flags |= def_SSL_inspection_session_flag_tcp_relay;
+					if(s_main_context->m_is_verbose >= 1) {
+						(void)SSL_inspection_fprintf(stdout,
+							"auto-detect: non-TLS → TCP relay (fd=%d)\n",
+							s_session->m_accept_socket);
+					}
+					s_progress = 1;
+				}
+			}
+
+			/* 단계 2b: 배너 버퍼 완료 후 서버 FIN → 즉시 TCP relay 전환 (EPOLLRDHUP busy-loop 방지)
+			 * 단계 3 이후에 실행: result가 이미 tls로 결정됐으면 이 블록은 건너뜀. */
+			if((s_session->m_flags & def_SSL_inspection_session_flag_connected) != 0 &&
+			   s_session->m_auto_detect_result == def_SSL_inspection_auto_detect_unknown &&
+			   s_session->m_backward_pending_size > 0u &&
+			   (s_session->m_connect_ready_events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0) {
+				s_session->m_auto_detect_result = def_SSL_inspection_auto_detect_timeout;
+				s_session->m_flags |= def_SSL_inspection_session_flag_tcp_relay;
+				if(s_main_context->m_is_verbose >= 1) {
+					(void)SSL_inspection_fprintf(stdout,
+						"auto-detect: server FIN with buffered banner — TCP relay (fd=%d)\n",
+						s_session->m_accept_socket);
+				}
+				s_progress = 1;
+			}
+
+			/* 단계 4: detect 확정 + connect 완료 → 상태 전이 */
+			if((s_session->m_auto_detect_result != def_SSL_inspection_auto_detect_unknown) &&
+			   ((s_session->m_flags & def_SSL_inspection_session_flag_connected) != 0)) {
+				if(s_session->m_auto_detect_result == def_SSL_inspection_auto_detect_tls) {
+					s_session->m_state = def_SSL_inspection_session_state_connect_ssl_handshake;
+					if(s_main_context->m_is_verbose >= 1) {
+						(void)SSL_inspection_fprintf(stdout,
+							"auto-detect: → SSL inspection (fd=%d)\n",
+							s_session->m_accept_socket);
+					}
+				}
+				else {
+					s_session->m_state = def_SSL_inspection_session_state_stream;
+					if(s_main_context->m_is_verbose >= 1) {
+						(void)SSL_inspection_fprintf(stdout,
+							"auto-detect: → TCP relay stream (buffered=%zu bytes, fd=%d)\n",
+							s_session->m_backward_pending_size, s_session->m_accept_socket);
+					}
+				}
+				s_progress = 1;
+			}
+
+			if(s_progress == 0) break;
+			continue;
+		}
+
+		/* ── peek_client_hello 상태: SNI 기반 per-cert 생성 후 연결 ── */
 		if(s_session->m_state == def_SSL_inspection_session_state_peek_client_hello) {
 			s_check = SSL_inspection_session_peek_sni(s_session);
 			if(SSL_inspection_unlikely(s_check < 0)) return(-1);
-			if(s_check == 0) break; /* no data yet — wait for EPOLLIN */
+			if(s_check == 0) {
+				/* no data yet — wait for EPOLLIN, but check timeout */
+				uint64_t s_elapsed = SSL_inspection_get_time_stamp_msec() - s_session->m_peek_start_ts;
+				if(s_elapsed < (uint64_t)s_main_context->m_peek_timeout_ms) break;
+				if(s_main_context->m_is_verbose >= 1) {
+					(void)SSL_inspection_fprintf(stdout,
+						"SNI peek: timeout — connecting without SNI (fd=%d)\n",
+						s_session->m_accept_socket);
+				}
+				/* fall through: connect without SNI */
+			}
+			/* s_check==2(non-TLS)는 --auto-detect-tls 없이는 기존처럼 TLS MITM 시도 */
 
 			/* loopback/any-address SNI는 유효한 origin 식별자가 아니므로 무시 */
 			if((s_session->m_sni_hostname[0] != '\0') &&
@@ -2926,6 +3191,7 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					"SNI peek: (none) -> global cert (fd=%d)\n",
 					s_session->m_accept_socket);
 			}
+			/* initiate_connect()가 m_state를 connecting/connect_ssl_handshake로 전진시킴 */
 			if(SSL_inspection_unlikely(SSL_inspection_session_initiate_connect(s_session) != 0)) return(-1);
 			s_progress = 1;
 			continue;
@@ -2957,7 +3223,9 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 			}
 		}
 
-		if((s_session->m_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) && ((s_session->m_flags & def_SSL_inspection_session_flag_ssl_accepted) == def_SSL_inspection_session_flag_none)) {
+		if((s_session->m_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) &&
+		   ((s_session->m_flags & def_SSL_inspection_session_flag_tcp_relay) == 0) &&
+		   ((s_session->m_flags & def_SSL_inspection_session_flag_ssl_accepted) == def_SSL_inspection_session_flag_none)) {
 			s_check = SSL_inspection_session_drive_handshake(s_session, 1);
 			if(SSL_inspection_unlikely(s_check == (-1))) {
 				return(-1);
@@ -3221,13 +3489,14 @@ int SSL_inspection_add_worker(SSL_inspection_main_context_t *s_main_context, uns
 		.m_max_epoll_events = s_max_worker_epoll_events,
 		.m_epoll_fd = epoll_create1(EPOLL_CLOEXEC),
 		.m_epoll_event = {},
-		.m_epoll_events = (struct epoll_event *)memset((void *)(&s_worker_context[1]), 0, (sizeof(struct epoll_event) * ((size_t)s_max_worker_epoll_events))),
+		.m_epoll_events = (struct epoll_event *)(&s_worker_context[1]),
 		.m_listen_socket = (-1),
 		.m_sockaddr_listen_bind = {},
 		.m_socklen_listen_bind = (socklen_t)sizeof(s_worker_context->m_sockaddr_listen_bind),
 		.m_forward_transfer_size = 0ull,
 		.m_backward_transfer_size = 0ull,
 	};
+	(void)memset((void *)(&s_worker_context[1]), 0, sizeof(struct epoll_event) * (size_t)s_max_worker_epoll_events);
 	if(SSL_inspection_unlikely(s_worker_context->m_epoll_fd == (-1))) {
 		SSL_inspection_perror("worker epoll_create1");
 		free((void *)s_worker_context);
@@ -3801,6 +4070,24 @@ void *SSL_inspection_worker_handler(void *s_worker_context_ptr)
 			}
 		}
 
+		/* auto_detect 세션 peek 타임아웃 스캔:
+		 * 서버 선행 프로토콜(SMTP/IMAP 등)에서 클라이언트가 데이터를 보내지 않으면
+		 * accept EPOLLIN이 발생하지 않으므로 epoll_wait 복귀마다 주기적으로 확인. */
+		if(s_main_context->m_use_auto_detect_tls != 0) {
+			uint64_t s_now = SSL_inspection_get_time_stamp_msec();
+			SSL_inspection_session_t *s_scan = s_worker_context->m_session_queue_head;
+			while(s_scan != ((SSL_inspection_session_t *)(NULL))) {
+				SSL_inspection_session_t *s_scan_next = s_scan->m_next;
+				if(((s_scan->m_state == def_SSL_inspection_session_state_auto_detect) ||
+				    (s_scan->m_state == def_SSL_inspection_session_state_peek_client_hello)) &&
+				   (s_scan->m_auto_detect_result == def_SSL_inspection_auto_detect_unknown) &&
+				   ((s_now - s_scan->m_peek_start_ts) >= (uint64_t)s_main_context->m_peek_timeout_ms)) {
+					SSL_inspection_worker_queue_job(s_worker_context, s_scan);
+				}
+				s_scan = s_scan_next;
+			}
+		}
+
 		if(s_worker_context->m_job_queue_head != ((SSL_inspection_session_t *)(NULL))) {
 			(void)SSL_inspection_worker_process_jobs(s_worker_context, (size_t)0u);
 		}
@@ -3903,6 +4190,8 @@ int main(int s_argc, char **s_argv)
 		.m_use_splice = 0,
 		.m_use_tproxy = 0,
 		.m_connect_address_explicit = 0,
+		.m_use_auto_detect_tls = 0,
+		.m_peek_timeout_ms     = 3000,
 		.m_pid = getpid(),
 #if defined(_SC_NPROCESSORS_ONLN)
 		.m_cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN),
@@ -3991,6 +4280,8 @@ int main(int s_argc, char **s_argv)
 			{"ktls", no_argument, (int *)(NULL), 0},
 			{"splice", no_argument, (int *)(NULL), 0},
 			{"tproxy", no_argument, (int *)(NULL), 0},
+			{"auto-detect-tls", no_argument,       (int *)(NULL), 0},
+			{"peek-timeout",    required_argument, (int *)(NULL), 0},
 			{(char *)(NULL), 0, (int *)(NULL), 0}
 		};
 		int s_option_index;
@@ -4023,26 +4314,32 @@ int main(int s_argc, char **s_argv)
 						s_main_context->m_use_multi_listen = 1;
 					}
 					else if(strcmp(sg_options[s_option_index].name, "buffer-size") == 0) {
-						int s_value = atoi(optarg);
-						if(s_value > 0) {
-							s_main_context->m_buffer_size = (size_t)s_value;
-						}
-						else {
+						char *s_endptr;
+						long s_value;
+						errno = 0;
+						s_value = strtol(optarg, &s_endptr, 10);
+						if((errno != 0) || (s_endptr == optarg) || (*s_endptr != '\0') || (s_value <= 0L) || ((size_t)s_value > (SIZE_MAX / 2u))) {
 							(void)SSL_inspection_fprintf(stderr, "invalid option value \"%s\" !\n", sg_options[s_option_index].name);
 							s_main_context->m_is_help = 1;
+						}
+						else {
+							s_main_context->m_buffer_size = (size_t)s_value;
 						}
 					}
 					else if(strcmp(sg_options[s_option_index].name, "serialize-lock") == 0) {
 						s_main_context->m_use_serialize_lock = 1;
 					}
 					else if(strcmp(sg_options[s_option_index].name, "thread-pool") == 0) {
-						int s_value = atoi(optarg);
-						if(s_value > 0) {
-							s_main_context->m_max_thread_pool = (unsigned int)s_value;
-						}
-						else {
+						char *s_endptr;
+						long s_value;
+						errno = 0;
+						s_value = strtol(optarg, &s_endptr, 10);
+						if((errno != 0) || (s_endptr == optarg) || (*s_endptr != '\0') || (s_value <= 0L) || (s_value > 4096L)) {
 							(void)SSL_inspection_fprintf(stderr, "invalid option value \"%s\" !\n", sg_options[s_option_index].name);
 							s_main_context->m_is_help = 1;
+						}
+						else {
+							s_main_context->m_max_thread_pool = (unsigned int)s_value;
 						}
 					}
 					else if(strcmp(sg_options[s_option_index].name, "nossl") == 0) {
@@ -4066,6 +4363,22 @@ int main(int s_argc, char **s_argv)
 					else if(strcmp(sg_options[s_option_index].name, "tproxy") == 0) {
 						s_main_context->m_use_tproxy = 1;
 					}
+					else if(strcmp(sg_options[s_option_index].name, "auto-detect-tls") == 0) {
+						s_main_context->m_use_auto_detect_tls = 1;
+					}
+					else if(strcmp(sg_options[s_option_index].name, "peek-timeout") == 0) {
+						char *s_endptr;
+						long s_value;
+						errno = 0;
+						s_value = strtol(optarg, &s_endptr, 10);
+						if((errno != 0) || (s_endptr == optarg) || (*s_endptr != '\0') || (s_value <= 0L) || (s_value > 3600000L)) {
+							(void)SSL_inspection_fprintf(stderr, "invalid option value \"%s\" !\n", sg_options[s_option_index].name);
+							s_main_context->m_is_help = 1;
+						}
+						else {
+							s_main_context->m_peek_timeout_ms = (int)s_value;
+						}
+					}
 					else { /* unknown option (unlikely) */
 						(void)SSL_inspection_fprintf(stderr, "unknown option \"%s\" !\n", sg_options[s_option_index].name);
 						s_main_context->m_is_help = 1;
@@ -4080,12 +4393,36 @@ int main(int s_argc, char **s_argv)
 				case 'e': s_main_context->m_engine_name = optarg; break;
 #endif
 				case 'b': s_main_context->m_bind_address = optarg; break;
-				case 'p': s_main_context->m_bind_port = atoi(optarg); break;
+				case 'p': {
+					char *s_ep; long s_pv;
+					errno = 0;
+					s_pv = strtol(optarg, &s_ep, 10);
+					if((errno != 0) || (s_ep == optarg) || (*s_ep != '\0') || (s_pv < 1L) || (s_pv > 65535L)) {
+						(void)SSL_inspection_fprintf(stderr, "invalid port value \"%s\" !\n", optarg);
+						s_main_context->m_is_help = 1;
+					}
+					else {
+						s_main_context->m_bind_port = (int)s_pv;
+					}
+					break;
+				}
 				case 'l': s_main_context->m_cipher_list = optarg; break;
 				case 'c': s_main_context->m_certificate_pathname = optarg; break;
 				case 'k': s_main_context->m_privatekey_pathname = optarg; break;
 				case 'B': s_main_context->m_connect_address = optarg; s_main_context->m_connect_address_explicit = 1; break;
-				case 'P': s_main_context->m_connect_port = atoi(optarg); break;
+				case 'P': {
+					char *s_ep; long s_pv;
+					errno = 0;
+					s_pv = strtol(optarg, &s_ep, 10);
+					if((errno != 0) || (s_ep == optarg) || (*s_ep != '\0') || (s_pv < 1L) || (s_pv > 65535L)) {
+						(void)SSL_inspection_fprintf(stderr, "invalid port value \"%s\" !\n", optarg);
+						s_main_context->m_is_help = 1;
+					}
+					else {
+						s_main_context->m_connect_port = (int)s_pv;
+					}
+					break;
+				}
 				case 'n': s_main_context->m_thread_model = 0; break;
 				case 'a': s_main_context->m_use_async = 1; break;
 				default: s_main_context->m_is_help = 1; break;
@@ -4131,6 +4468,10 @@ int main(int s_argc, char **s_argv)
 				"\t                              iptables TPROXY rule and policy routing)\n"
 				"\t                              if -B is also given, self-address is detected\n"
 				"\t                              and falls back to -B/-P automatically\n"
+				"\t    --auto-detect-tls       : per-connection TLS/TCP auto detection;\n"
+				"\t                              connect server immediately then peek client first bytes;\n"
+				"\t                              TLS ClientHello → SSL MITM, otherwise → plain TCP relay\n"
+				"\t    --peek-timeout=<ms>     : server-speaks-first fallback timeout (default: 3000ms)\n"
 				"\n",
 				s_main_context->m_program_name,
 				__DATE__,
@@ -4146,6 +4487,14 @@ int main(int s_argc, char **s_argv)
 		}
 	}while(0);
 
+	/* --auto-detect-tls 옵션 검증 */
+	if(s_main_context->m_use_auto_detect_tls != 0) {
+		if(s_main_context->m_use_ssl == 0) {
+			(void)SSL_inspection_fprintf(stderr,
+				"ERROR: --auto-detect-tls requires SSL mode (do not use --nossl)\n");
+			return(EXIT_FAILURE);
+		}
+	}
 
 	(void)SSL_inspection_fprintf(
 		stdout,
