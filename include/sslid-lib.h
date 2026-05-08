@@ -97,8 +97,11 @@ typedef struct mystruct {
 #include <openssl/aes.h>
 
 #include <openssl/md5.h>
+#include <openssl/ec.h>
+#include <openssl/objects.h>
 
 #include <openssl/hmac.h>
+#include <openssl/x509v3.h>
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
 # include <openssl/provider.h>
@@ -331,6 +334,58 @@ struct SSL_inspection_async_wait_ts {
 };
 #pragma pack(pop)
 
+/* --- 2-tier SNI certificate cache --- */
+
+#define def_ssl_cert_cache_global_bucket_bits  12u
+#define def_ssl_cert_cache_global_bucket_count (1u << def_ssl_cert_cache_global_bucket_bits)
+#define def_ssl_cert_cache_global_max_entries  def_ssl_cert_cache_global_bucket_count
+#define def_ssl_cert_cache_local_bucket_bits   6u
+#define def_ssl_cert_cache_local_bucket_count  (1u << def_ssl_cert_cache_local_bucket_bits)
+#define def_ssl_cert_cache_local_max_entries   def_ssl_cert_cache_local_bucket_count
+#define def_ssl_cert_cache_ttl_secs            (60L * 60L * 24L)
+#define def_ssl_cert_cache_leaf_validity_secs  (60L * 60L * 24L * 365L * 2L)
+
+#define ssl_cert_cache_entry_t  __ssl_cert_cache_entry_t
+typedef struct ssl_cert_cache_entry_ts  __ssl_cert_cache_entry_t;
+#define ssl_cert_cache_global_t __ssl_cert_cache_global_t
+typedef struct ssl_cert_cache_global_ts __ssl_cert_cache_global_t;
+#define ssl_cert_cache_local_t  __ssl_cert_cache_local_t
+typedef struct ssl_cert_cache_local_ts  __ssl_cert_cache_local_t;
+
+#pragma pack(push, 8)
+struct ssl_cert_cache_entry_ts {
+	char                    m_sni[256];   /* normalized SNI (lower-case, no trailing dot) */
+	uint32_t                m_hash;       /* FNV-1a hash of m_sni */
+	X509                   *m_cert;       /* leaf cert (OpenSSL-refcounted) */
+	EVP_PKEY               *m_pkey;       /* leaf private key (OpenSSL-refcounted) */
+	time_t                  m_expiry;     /* unix timestamp after which entry is stale */
+	ssl_cert_cache_entry_t *m_hash_next;  /* next in bucket chain */
+	ssl_cert_cache_entry_t *m_hash_prev;
+	ssl_cert_cache_entry_t *m_lru_next;   /* LRU list: head = most-recently used */
+	ssl_cert_cache_entry_t *m_lru_prev;
+};
+#pragma pack(pop)
+
+#pragma pack(push, 8)
+struct ssl_cert_cache_global_ts {
+	pthread_rwlock_t        m_rwlock;
+	ssl_cert_cache_entry_t *m_buckets[def_ssl_cert_cache_global_bucket_count];
+	ssl_cert_cache_entry_t *m_lru_head;
+	ssl_cert_cache_entry_t *m_lru_tail;
+	size_t                  m_count;
+	size_t                  m_max_count;
+};
+#pragma pack(pop)
+
+#pragma pack(push, 8)
+struct ssl_cert_cache_local_ts {
+	ssl_cert_cache_entry_t *m_buckets[def_ssl_cert_cache_local_bucket_count];
+	ssl_cert_cache_entry_t *m_lru_head;
+	ssl_cert_cache_entry_t *m_lru_tail;
+	size_t                  m_count;
+};
+#pragma pack(pop)
+
 #pragma pack(push,8)
 struct SSL_inspect_session_ts {
 	SSL_inspection_session_t *m_next;
@@ -372,6 +427,8 @@ struct SSL_inspect_session_ts {
 
 	unsigned long long m_forward_transfer_size;
 	unsigned long long m_backward_transfer_size;
+	unsigned long long m_forward_transfer_count;
+	unsigned long long m_backward_transfer_count;
 
 	size_t m_forward_pending_offset;
 	size_t m_forward_pending_size;
@@ -443,6 +500,8 @@ struct SSL_inspection_worker_context_ts {
 
 	unsigned long long m_forward_transfer_size;
 	unsigned long long m_backward_transfer_size;
+
+	ssl_cert_cache_local_t  m_cert_cache_local; /* per-worker SNI cert LRU (no lock) */
 };
 #pragma pack(pop)
 
@@ -511,6 +570,10 @@ struct SSL_inspection_main_context_ts {
 	const SSL_METHOD *m_client_ssl_method;
 	SSL_CTX *m_ssl_ctx;
 	SSL_CTX *m_client_ssl_ctx; /* shared client-side SSL_CTX, reused via SSL_new() per session */
+
+	EVP_PKEY               *m_ca_pkey;    /* CA private key for signing per-SNI leaf certs */
+	X509                   *m_ca_x509;    /* CA self-signed certificate (clients must trust this) */
+	ssl_cert_cache_global_t *m_cert_cache; /* global SNI cert cache shared across all workers */
 
 	struct sockaddr_storage m_sockaddr_connect_bind;
 	socklen_t m_socklen_connect_bind;

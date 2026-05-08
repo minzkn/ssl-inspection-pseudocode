@@ -174,7 +174,7 @@ endif
 
 CFLAGS_COMMON +=-D_REENTRANT# thread safety (optional)
 CFLAGS_COMMON +=-D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64# enable 64-bits file i/o compatibility (optional)
-CFLAGS_COMMON +=-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0# glibc run-time compatibility compile (optional)
+CFLAGS_COMMON +=-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2# glibc run-time buffer overflow detection
 
 ifeq ($(DEF_ENABLE_TEST_VECTOR),yes)
 CFLAGS_COMMON +=-Ddef_sslid_test_vector=1#

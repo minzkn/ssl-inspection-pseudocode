@@ -56,7 +56,7 @@ static void SSL_inspection_signal_safe_backtrace(void)
 	static const char cg_bt_hdr[] = "backtrace:\n";
 
 	s_bt_size = backtrace(s_bt, (int)(sizeof(s_bt) / sizeof(void *)));
-	(void)write(STDERR_FILENO, cg_bt_hdr, sizeof(cg_bt_hdr) - 1);
+	{ ssize_t s_wr_ = write(STDERR_FILENO, cg_bt_hdr, sizeof(cg_bt_hdr) - 1); (void)s_wr_; }
 	if (s_bt_size > 0) {
 		backtrace_symbols_fd(s_bt, s_bt_size, STDERR_FILENO);
 	}
@@ -84,7 +84,7 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGSYS:
 #endif
 		case SIGABRT:
-			(void)write(STDERR_FILENO, cg_signal_msg, sizeof(cg_signal_msg) - 1);
+			{ ssize_t s_wr_ = write(STDERR_FILENO, cg_signal_msg, sizeof(cg_signal_msg) - 1); (void)s_wr_; }
 			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
 				_exit(128 | s_signo);
 			}
@@ -96,7 +96,7 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGQUIT: /* 강제 종료 */
 		case SIGINT: /* Ctrl + C */
 		case SIGTERM:
-			(void)write(STDERR_FILENO, cg_quit_msg, sizeof(cg_quit_msg) - 1);
+			{ ssize_t s_wr_ = write(STDERR_FILENO, cg_quit_msg, sizeof(cg_quit_msg) - 1); (void)s_wr_; }
 			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
 				_exit(128 | s_signo);
 			}
@@ -153,7 +153,15 @@ int SSL_inspection_install_signal_handler(void)
 
 	/* ignore */
 	(void)sigaction(SIGHUP,   &sa, (struct sigaction *)(NULL));
-	(void)sigaction(SIGPIPE,  &sa, (struct sigaction *)(NULL));
+
+	/* SIGPIPE: ignore directly — cleaner than routing through the handler */
+	{
+		struct sigaction sa_ign;
+		(void)memset((void *)(&sa_ign), 0, sizeof(sa_ign));
+		sa_ign.sa_handler = SIG_IGN;
+		(void)sigemptyset(&sa_ign.sa_mask);
+		(void)sigaction(SIGPIPE, &sa_ign, (struct sigaction *)(NULL));
+	}
 
 	return(0);
 }

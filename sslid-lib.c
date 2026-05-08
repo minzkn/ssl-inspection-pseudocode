@@ -78,23 +78,8 @@ void SSL_inspection_secure_memzero(void *ptr, size_t size)
 		return;
 	}
 
-#if defined(OPENSSL_cleanse)
-	/* Prefer OpenSSL's cleanse function if available */
+	/* OPENSSL_cleanse is a function (not a macro), always available here */
 	OPENSSL_cleanse(ptr, size);
-#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25))
-	/* Use explicit_bzero on glibc >= 2.25 */
-	explicit_bzero(ptr, size);
-#elif defined(_WIN32)
-	SecureZeroMemory(ptr, size);
-#else
-	/* Fallback: volatile pointer prevents optimization */
-	volatile unsigned char *volatile p = (volatile unsigned char *volatile)ptr;
-	while (size--) {
-		*p++ = 0;
-	}
-	/* Memory barrier to ensure the writes are not reordered */
-	__asm__ __volatile__("" : : "r"(ptr) : "memory");
-#endif
 }
 
 int SSL_inspection_ratelimited_message_check(void)
@@ -408,42 +393,23 @@ const void *SSL_inspection_hexdump(const char *s_prefix, const void *s_data, siz
 
 void SSL_inspection_dump_backtrace(void)
 {
-	/* IMPORTANT
-
-		gcc need compile option "-fno-omit-frame-pointer"
-		gcc optional linker option "-rdynamic"
-
-	*/
+	/* gcc options: -fno-omit-frame-pointer, optionally -rdynamic */
 	void *s_backtrace_buffer[16];
-	char **s_backtrace_symbols;
 	int s_backtrace_size;
-	int s_backtrace_index;
+	static const char s_hdr[] = "backtrace:\n";
 
 	s_backtrace_size = backtrace(
 		(void **)(&s_backtrace_buffer[0]),
 		(int)(sizeof(s_backtrace_buffer) / sizeof(void *))
 	);
-	if(SSL_inspection_unlikely(s_backtrace_size <= 0)) {
-		s_backtrace_symbols = (char **)(NULL);
-	}
-	else {
-		s_backtrace_symbols = backtrace_symbols(
+	{ ssize_t s_wr_ = write(STDERR_FILENO, s_hdr, sizeof(s_hdr) - 1); (void)s_wr_; }
+	if(s_backtrace_size > 0) {
+		backtrace_symbols_fd(
 			(void * const *)(&s_backtrace_buffer[0]),
-			s_backtrace_size
+			s_backtrace_size,
+			STDERR_FILENO
 		);
 	}
-
-	(void)fprintf(stderr, "backtrace() returned %d addresses\n", s_backtrace_size);
-	for(s_backtrace_index = 0;s_backtrace_index < s_backtrace_size;s_backtrace_index++) {
-		(void)fprintf(
-			stderr,
-			"%02d - %p - %s\n",
-			s_backtrace_index + 1,
-			s_backtrace_buffer[s_backtrace_index],
-			(s_backtrace_symbols == ((char **)(NULL))) ? "<unknown symbol>" : s_backtrace_symbols[s_backtrace_index]
-		);
-	}
-	free((void *)s_backtrace_symbols);
 }
 
 int SSL_inspection_string_to_sockaddr(int s_family, const char *s_address, int s_port, void *s_sockaddr_ptr, socklen_t *s_socklen_ptr)
@@ -929,24 +895,23 @@ int SSL_inspection_shutdown(SSL *s_ssl)
 		s_check = SSL_shutdown(s_ssl);
 		if(s_check < 0) {
 			int s_ssl_error = SSL_get_error(s_ssl, s_check);
-			switch(s_ssl_error) {
-				case SSL_ERROR_WANT_READ:
-				case SSL_ERROR_WANT_WRITE:
-				case SSL_ERROR_WANT_ASYNC:
-				case SSL_ERROR_WANT_ASYNC_JOB:
-					if(s_loop > 1000) {
-						(void)SSL_inspection_fprintf(stderr, "SSL_shutdown busy (loop=%d, error=%d)\n", s_loop, s_ssl_error);
-						break;
-					}
+			if(s_ssl_error == SSL_ERROR_WANT_READ  ||
+			   s_ssl_error == SSL_ERROR_WANT_WRITE ||
+			   s_ssl_error == SSL_ERROR_WANT_ASYNC ||
+			   s_ssl_error == SSL_ERROR_WANT_ASYNC_JOB) {
+				if(s_loop > 1000) {
+					(void)SSL_inspection_fprintf(stderr, "SSL_shutdown busy (loop=%d, error=%d)\n", s_loop, s_ssl_error);
+					s_check = 0; /* give up, treat as done */
+				} else {
 					/* Brief sleep avoids spinning at 100% CPU while waiting
 					 * for the peer's close_notify on a non-blocking socket. */
-					{
-						struct timespec ts = {0, 1000000}; /* 1 ms */
-						(void)nanosleep(&ts, (struct timespec *)(NULL));
-					}
+					struct timespec ts = {0, 1000000}; /* 1 ms */
+					(void)nanosleep(&ts, (struct timespec *)(NULL));
 					continue;
+				}
+			} else {
+				s_check = 0; /* unhandled error → treat as done */
 			}
-			s_check = 0;
 		}
 	}while(s_check < 0);
 
@@ -1556,7 +1521,7 @@ ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		return((ssize_t)(-1));
 	}
 
-	if((s_aad == ((const void *)(NULL))) && (s_aad_size <= ((size_t)0u))) {
+	if((s_aad == ((const void *)(NULL))) || (s_aad_size <= ((size_t)0u))) {
 		static const uint8_t cg_empty[1] = {0};
 		s_aad = (const void *)(&cg_empty[0]);
 	}
@@ -1659,7 +1624,7 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 	}
 
 	if(s_cipher == ((const EVP_CIPHER *)(NULL))) {
-		s_cipher = EVP_aes_128_gcm();
+		s_cipher = EVP_aes_256_gcm();
 	}
 	s_check = EVP_DecryptInit_ex(
 		s_evp_cipher_ctx /* ctx */,
@@ -1707,7 +1672,7 @@ ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s
 		return((ssize_t)(-1));
 	}
 
-	if((s_aad == ((const void *)(NULL))) && (s_aad_size <= ((size_t)0u))) {
+	if((s_aad == ((const void *)(NULL))) || (s_aad_size <= ((size_t)0u))) {
 		static const uint8_t cg_empty[1] = {0};
 		s_aad = (const void *)(&cg_empty[0]);
 	}

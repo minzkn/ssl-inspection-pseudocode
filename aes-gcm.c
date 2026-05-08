@@ -34,9 +34,9 @@
 
 /* ---- */
 
-static void aes_gctr(void *aes, const uint8_t *icb, const uint8_t *x, size_t xlen, uint8_t *y);
+static void aes_gctr(void *aes, size_t key_len, const uint8_t *icb, const uint8_t *x, size_t xlen, uint8_t *y);
 static void aes_gcm_prepare_j0(const uint8_t *iv, size_t iv_len, const uint8_t *H, uint8_t *J0);
-static void aes_gcm_gctr(void *aes, const uint8_t *J0, const uint8_t *in, size_t len, uint8_t *out);
+static void aes_gcm_gctr(void *aes, size_t key_len, const uint8_t *J0, const uint8_t *in, size_t len, uint8_t *out);
 static void aes_gcm_ghash(const uint8_t *H, const uint8_t *aad, size_t aad_len, const uint8_t *crypt, size_t crypt_len, uint8_t *S);
 int aes_gcm_ae(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_len, const uint8_t *plain, size_t plain_len, const uint8_t *aad, size_t aad_len, uint8_t *crypt, uint8_t *tag);
 int aes_gcm_ad(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_len, const uint8_t *crypt, size_t crypt_len, const uint8_t *aad, size_t aad_len, const uint8_t *tag, uint8_t *plain);
@@ -44,15 +44,23 @@ int aes_gmac(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_le
 
 /* ---- */
 
-static void aes_gctr(void *aes, const uint8_t *icb, const uint8_t *x, size_t xlen, uint8_t *y)
+static void aes_gctr(void *aes, size_t key_len, const uint8_t *icb, const uint8_t *x, size_t xlen, uint8_t *y)
 {
 	size_t i, n, last;
 	uint8_t cb[def_hwport_aes_block_size], tmp[def_hwport_aes_block_size];
 	const uint8_t *xpos = x;
 	uint8_t *ypos = y;
+	void *(*aes_ecb_fn)(void *, size_t, const void *);
 
 	if (xlen == 0)
 		return;
+
+	if (key_len == def_hwport_aes256_user_key_size)
+		aes_ecb_fn = hwport_encrypt_aes256_ecb;
+	else if (key_len == def_hwport_aes192_user_key_size)
+		aes_ecb_fn = hwport_encrypt_aes192_ecb;
+	else
+		aes_ecb_fn = hwport_encrypt_aes128_ecb;
 
 	n = xlen / 16;
 
@@ -60,7 +68,7 @@ static void aes_gctr(void *aes, const uint8_t *icb, const uint8_t *x, size_t xle
 	/* Full blocks */
 	for (i = 0; i < n; i++) {
 		(void)SSL_inspection_xor_block(
-			hwport_encrypt_aes128_ecb(
+			aes_ecb_fn(
 				memcpy(ypos, cb, def_hwport_aes_block_size),
 				def_hwport_aes_block_size,
 				aes
@@ -79,7 +87,7 @@ static void aes_gctr(void *aes, const uint8_t *icb, const uint8_t *x, size_t xle
 	last = xlen - n * (size_t)16u;
 	if (last) {
 		/* Last, partial block */
-		(void)hwport_encrypt_aes128_ecb(
+		(void)aes_ecb_fn(
 			memcpy(tmp, cb, def_hwport_aes_block_size),
 			def_hwport_aes_block_size,
 			aes
@@ -111,7 +119,7 @@ static void aes_gcm_prepare_j0(const uint8_t *iv, size_t iv_len, const uint8_t *
 	}
 }
 
-static void aes_gcm_gctr(void *aes, const uint8_t *J0, const uint8_t *in, size_t len, uint8_t *out)
+static void aes_gcm_gctr(void *aes, size_t key_len, const uint8_t *J0, const uint8_t *in, size_t len, uint8_t *out)
 {
 	uint8_t J0inc[def_hwport_aes_block_size];
 
@@ -123,7 +131,7 @@ static void aes_gcm_gctr(void *aes, const uint8_t *J0, const uint8_t *in, size_t
 		(void *)(&J0inc[def_hwport_aes_block_size - sizeof(uint32_t)]),
 		(size_t)sizeof(uint32_t)
 	);
-	aes_gctr(aes, J0inc, in, len, out);
+	aes_gctr(aes, key_len, J0inc, in, len, out);
 }
 
 static void aes_gcm_ghash(const uint8_t *H, const uint8_t *aad, size_t aad_len, const uint8_t *crypt, size_t crypt_len, uint8_t *S)
@@ -149,39 +157,48 @@ static void aes_gcm_ghash(const uint8_t *H, const uint8_t *aad, size_t aad_len, 
  */
 int aes_gcm_ae(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_len, const uint8_t *plain, size_t plain_len, const uint8_t *aad, size_t aad_len, uint8_t *crypt, uint8_t *tag)
 {
-	uint8_t s_round_key[def_hwport_aes128_round_key_size];
+	uint8_t s_round_key[def_hwport_aes_max_round_key_size];
 	uint8_t H[def_hwport_aes_block_size];
 	uint8_t J0[def_hwport_aes_block_size];
 	uint8_t S[16];
-	
-	(void)key_len;
- 
-	(void)hwport_make_round_key_aes128(
-		(void *)(&s_round_key[0]),
-		(const void *)key
-	);
+
+	if (key_len == def_hwport_aes256_user_key_size)
+		(void)hwport_make_round_key_aes256((void *)(&s_round_key[0]), (const void *)key);
+	else if (key_len == def_hwport_aes192_user_key_size)
+		(void)hwport_make_round_key_aes192((void *)(&s_round_key[0]), (const void *)key);
+	else
+		(void)hwport_make_round_key_aes128((void *)(&s_round_key[0]), (const void *)key);
 
 	/* Generate hash subkey H = AES_K(0^128) */
-	(void)hwport_encrypt_aes128_ecb(
-		memset((void *)(&H[0]), 0, sizeof(H)),
-		sizeof(H),
-		(const void *)(&s_round_key[0])
-	);
+	{
+		void *(*aes_ecb_fn)(void *, size_t, const void *);
+		if (key_len == def_hwport_aes256_user_key_size)
+			aes_ecb_fn = hwport_encrypt_aes256_ecb;
+		else if (key_len == def_hwport_aes192_user_key_size)
+			aes_ecb_fn = hwport_encrypt_aes192_ecb;
+		else
+			aes_ecb_fn = hwport_encrypt_aes128_ecb;
+		(void)aes_ecb_fn(
+			memset((void *)(&H[0]), 0, sizeof(H)),
+			sizeof(H),
+			(const void *)(&s_round_key[0])
+		);
+	}
 
 	/* - */
 
 	aes_gcm_prepare_j0(iv, iv_len, H, J0);
 
 	/* C = GCTR_K(inc_32(J_0), P) */
-	aes_gcm_gctr(s_round_key, J0, plain, plain_len, crypt);
+	aes_gcm_gctr(s_round_key, key_len, J0, plain, plain_len, crypt);
 
 	aes_gcm_ghash(H, aad, aad_len, crypt, plain_len, S);
 
 	/* T = MSB_t(GCTR_K(J_0, S)) */
-	aes_gctr(s_round_key, J0, S, sizeof(S), tag);
+	aes_gctr(s_round_key, key_len, J0, S, sizeof(S), tag);
 
 	/* Return (C, T) */
-	
+
 	/* - */
 
 	/* clean round key */
@@ -195,36 +212,45 @@ int aes_gcm_ae(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_
  */
 int aes_gcm_ad(const uint8_t *key, size_t key_len, const uint8_t *iv, size_t iv_len, const uint8_t *crypt, size_t crypt_len, const uint8_t *aad, size_t aad_len, const uint8_t *tag, uint8_t *plain)
 {
-	uint8_t s_round_key[def_hwport_aes128_round_key_size];
+	uint8_t s_round_key[def_hwport_aes_max_round_key_size];
 	uint8_t H[def_hwport_aes_block_size];
 	uint8_t J0[def_hwport_aes_block_size];
 	uint8_t S[16], T[16];
 
-	(void)key_len;
-
-	(void)hwport_make_round_key_aes128(
-		(void *)(&s_round_key[0]),
-		(const void *)key
-	);
+	if (key_len == def_hwport_aes256_user_key_size)
+		(void)hwport_make_round_key_aes256((void *)(&s_round_key[0]), (const void *)key);
+	else if (key_len == def_hwport_aes192_user_key_size)
+		(void)hwport_make_round_key_aes192((void *)(&s_round_key[0]), (const void *)key);
+	else
+		(void)hwport_make_round_key_aes128((void *)(&s_round_key[0]), (const void *)key);
 
 	/* Generate hash subkey H = AES_K(0^128) */
-	(void)hwport_encrypt_aes128_ecb(
-		memset((void *)(&H[0]), 0, sizeof(H)),
-		sizeof(H),
-		(const void *)(&s_round_key[0])
-	);
-	
+	{
+		void *(*aes_ecb_fn)(void *, size_t, const void *);
+		if (key_len == def_hwport_aes256_user_key_size)
+			aes_ecb_fn = hwport_encrypt_aes256_ecb;
+		else if (key_len == def_hwport_aes192_user_key_size)
+			aes_ecb_fn = hwport_encrypt_aes192_ecb;
+		else
+			aes_ecb_fn = hwport_encrypt_aes128_ecb;
+		(void)aes_ecb_fn(
+			memset((void *)(&H[0]), 0, sizeof(H)),
+			sizeof(H),
+			(const void *)(&s_round_key[0])
+		);
+	}
+
 	/* - */
 
 	aes_gcm_prepare_j0(iv, iv_len, H, J0);
 
 	/* P = GCTR_K(inc_32(J_0), C) */
-	aes_gcm_gctr(s_round_key, J0, crypt, crypt_len, plain);
+	aes_gcm_gctr(s_round_key, key_len, J0, crypt, crypt_len, plain);
 
 	aes_gcm_ghash(H, aad, aad_len, crypt, crypt_len, S);
 
 	/* T' = MSB_t(GCTR_K(J_0, S)) */
-	aes_gctr(s_round_key, J0, S, sizeof(S), T);
+	aes_gctr(s_round_key, key_len, J0, S, sizeof(S), T);
 
 	/* - */
 

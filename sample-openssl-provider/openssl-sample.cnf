@@ -1,0 +1,27 @@
+# openssl-sample.cnf
+#
+# Sample openssl.cnf that loads the sample provider alongside the built-in
+# default provider.  Use this file with the OPENSSL_CONF environment variable:
+#
+#   OPENSSL_CONF=./openssl-sample.cnf \
+#   OPENSSL_MODULES=./build            \
+#   openssl dgst -provider sample -sha256 /etc/hostname
+#
+# The "sample" provider is loaded from the directory pointed to by
+# OPENSSL_MODULES (or the compiled-in MODULESDIR if not set).
+
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+sample  = sample_sect
+
+[default_sect]
+activate = 1
+
+[sample_sect]
+activate = 1
+# module = /absolute/path/to/sample.so   # override if OPENSSL_MODULES is not set

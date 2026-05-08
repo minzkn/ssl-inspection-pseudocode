@@ -10,12 +10,28 @@
 #include "sslid-lib.h"
 
 #include <getopt.h>
+#include <unistd.h>
 
 #if defined(def_sslid_use_dpdk_lcore)
 # include <rte_lcore.h>
 #endif
 
 #define def_SSL_inspection_epoll_session_base_events ((uint32_t)(EPOLLERR | EPOLLHUP | EPOLLRDHUP))
+
+/* Runtime ANSI color strings — non-empty only when the target fd is a TTY.
+   Initialized once in main() via isatty(). Empty strings produce no output. */
+/* stdout colors */
+static const char *sg_co_n = ""; /* reset/normal */
+static const char *sg_co_c = ""; /* cyan    — [C-fd=N] session tag */
+static const char *sg_co_y = ""; /* yellow  — S-fd=N, sni hostname */
+static const char *sg_co_g = ""; /* green   — Accepted / connected / closed */
+static const char *sg_co_m = ""; /* magenta — SSL Accepted / SSL Connected */
+static const char *sg_co_w = ""; /* white   — numeric values */
+/* stderr colors */
+static const char *sg_ce_n = ""; /* reset/normal */
+static const char *sg_ce_c = ""; /* cyan   — [C-fd=N] session tag */
+static const char *sg_ce_r = ""; /* red    — error messages */
+static const char *sg_ce_y = ""; /* yellow — sni / values in errors */
 
 SSL_inspection_session_t *SSL_inspection_new_and_accept_session(SSL_inspection_main_context_t *s_main_context, int s_listen_socket);
 SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *s_session);
@@ -37,7 +53,7 @@ void SSL_inspection_worker_queue_job(SSL_inspection_worker_context_t *s_worker_c
 SSL_inspection_session_t *SSL_inspection_worker_pop_job(SSL_inspection_worker_context_t *s_worker_context);
 int SSL_inspection_worker_unlink_session(SSL_inspection_worker_context_t *s_worker_context, SSL_inspection_session_t *s_session);
 void SSL_inspection_worker_release_session_resources(SSL_inspection_worker_context_t *s_worker_context, SSL_inspection_session_t *s_session);
-void SSL_inspection_trace_transfer(SSL_inspection_main_context_t *s_main_context, const char *s_title, int s_fd, unsigned long long s_transferred, const void *s_buffer, size_t s_size);
+void SSL_inspection_trace_transfer(SSL_inspection_main_context_t *s_main_context, int s_accept_fd, const char *s_title, int s_fd, unsigned long long s_transferred, const void *s_buffer, size_t s_size);
 int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_worker_context, SSL_inspection_session_t *s_session);
 int SSL_inspection_session_update_epoll(SSL_inspection_session_t *s_session);
 void SSL_inspection_session_clear_async_wait(SSL_inspection_session_t *s_session, SSL_inspection_async_wait_t *s_async_wait);
@@ -94,6 +110,8 @@ SSL_inspection_session_t *SSL_inspection_new_and_accept_session(SSL_inspection_m
 		.m_connect_ssl = NULL,
 		.m_forward_transfer_size = 0,
 		.m_backward_transfer_size = 0,
+		.m_forward_transfer_count = 0,
+		.m_backward_transfer_count = 0,
 		.m_buffer_size = s_main_context->m_buffer_size,
 		/* Inline buffers follow the session structure */
 		.m_buffer = (uint8_t *)(&s_session[1]),
@@ -128,6 +146,37 @@ SSL_inspection_session_t *SSL_inspection_new_and_accept_session(SSL_inspection_m
 	return s_session;
 }
 
+static void SSL_inspection_session_format_tuple(const SSL_inspection_session_t *s_session, char *out, size_t out_size)
+{
+	int s_src_port = 0;
+	char s_dst_str[INET6_ADDRSTRLEN] = {0};
+	int s_dst_port = 0;
+	const SSL_inspection_main_context_t *s_main_context = s_session->m_main_context;
+
+	if(s_session->m_sockaddr_accept.ss_family == AF_INET) {
+		s_src_port = (int)ntohs(((const struct sockaddr_in *)(&s_session->m_sockaddr_accept))->sin_port);
+	}
+	else if(s_session->m_sockaddr_accept.ss_family == AF_INET6) {
+		s_src_port = (int)ntohs(((const struct sockaddr_in6 *)(&s_session->m_sockaddr_accept))->sin6_port);
+	}
+	if(s_session->m_sockaddr_original_dst.ss_family == AF_INET) {
+		(void)inet_ntop(AF_INET, &((const struct sockaddr_in *)(&s_session->m_sockaddr_original_dst))->sin_addr,
+			s_dst_str, (socklen_t)sizeof(s_dst_str));
+		s_dst_port = (int)ntohs(((const struct sockaddr_in *)(&s_session->m_sockaddr_original_dst))->sin_port);
+	}
+	else if(s_session->m_sockaddr_original_dst.ss_family == AF_INET6) {
+		(void)inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)(&s_session->m_sockaddr_original_dst))->sin6_addr,
+			s_dst_str, (socklen_t)sizeof(s_dst_str));
+		s_dst_port = (int)ntohs(((const struct sockaddr_in6 *)(&s_session->m_sockaddr_original_dst))->sin6_port);
+	}
+	else if(s_main_context != ((const SSL_inspection_main_context_t *)(NULL))) {
+		(void)snprintf(s_dst_str, sizeof(s_dst_str), "%s", s_main_context->m_connect_address);
+		s_dst_port = s_main_context->m_connect_port;
+	}
+	(void)snprintf(out, out_size, "[%s]:%d -> [%s]:%d",
+		s_session->m_accept_address_string, s_src_port, s_dst_str, s_dst_port);
+}
+
 SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *s_session)
 {
 	SSL_inspection_main_context_t *s_main_context;
@@ -139,11 +188,30 @@ SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *
 		return NULL;
 	}
 	s_main_context = s_session->m_main_context;
+	{
+		int s_accept_fd = s_session->m_accept_socket; /* capture before cleanup zeroes it */
+
+	if(s_main_context->m_is_verbose >= 1) {
+		char s_tuple[128];
+		SSL_inspection_session_format_tuple(s_session, s_tuple, sizeof(s_tuple));
+		(void)SSL_inspection_fprintf(
+			stdout,
+			"%s[C-fd=%d]%s %sClosed%s %s (%sS-fd=%d%s): fwd %llu pkts / %llu bytes, bwd %llu pkts / %llu bytes\n",
+			sg_co_c, s_accept_fd, sg_co_n,
+			sg_co_g, sg_co_n,
+			s_tuple,
+			sg_co_y, s_session->m_connect_socket, sg_co_n,
+			s_session->m_forward_transfer_count,
+			s_session->m_forward_transfer_size,
+			s_session->m_backward_transfer_count,
+			s_session->m_backward_transfer_size
+		);
+	}
 
 	/* accept side */
 	if(s_session->m_accept_ssl != ((SSL *)(NULL))) {
-		if(s_main_context->m_is_verbose >= 1) {
-			(void)SSL_inspection_fprintf(stdout, "SSL free (accept, fd=%d)\n", s_session->m_accept_socket);
+		if(s_main_context->m_is_verbose >= 2) {
+			(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s SSL free (accept)\n", sg_co_c, s_accept_fd, sg_co_n);
 		}
 		SSL_set_quiet_shutdown(s_session->m_accept_ssl, 1);
 		SSL_set_shutdown(s_session->m_accept_ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
@@ -154,20 +222,17 @@ SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *
 	}
 
 	if(s_session->m_accept_socket != (-1)) {
-		if(s_main_context->m_is_verbose >= 1) {
-			(void)SSL_inspection_fprintf(stdout, "Disconnecting (accept, fd=%d)\n", s_session->m_accept_socket);
+		if(s_main_context->m_is_verbose >= 2) {
+			(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s Disconnecting (accept)\n", sg_co_c, s_accept_fd, sg_co_n);
 		}
 
 		(void)shutdown(s_session->m_accept_socket, SHUT_RDWR);
 
 		s_check = SSL_inspection_closesocket(s_session->m_accept_socket);
 		if(SSL_inspection_unlikely(s_check == (-1))) {
-			(void)SSL_inspection_fprintf(
-				stderr,
-				"close accept socket ! : %s (fd=%d)\n",
-				strerror(errno),
-				s_session->m_accept_socket
-			);
+			(void)SSL_inspection_fprintf(stderr,
+				"%s[C-fd=%d]%s %sclose accept socket failed%s: %s\n",
+				sg_ce_c, s_accept_fd, sg_ce_n, sg_ce_r, sg_ce_n, strerror(errno));
 		}
 		s_session->m_accept_socket = (-1);
 		s_session->m_flags &= (~def_SSL_inspection_session_flag_accepted);
@@ -175,8 +240,8 @@ SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *
 
 	/* connect side */
 	if(s_session->m_connect_ssl != ((SSL *)(NULL))) {
-		if(s_main_context->m_is_verbose >= 1) {
-			(void)SSL_inspection_fprintf(stdout, "SSL free (connect, fd=%d)\n", s_session->m_connect_socket);
+		if(s_main_context->m_is_verbose >= 2) {
+			(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s SSL free (%sS-fd=%d%s)\n", sg_co_c, s_accept_fd, sg_co_n, sg_co_y, s_session->m_connect_socket, sg_co_n);
 		}
 		SSL_set_quiet_shutdown(s_session->m_connect_ssl, 1);
 		SSL_set_shutdown(s_session->m_connect_ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
@@ -187,20 +252,17 @@ SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *
 	}
 
 	if(s_session->m_connect_socket != (-1)) {
-		if(s_main_context->m_is_verbose >= 1) {
-			(void)SSL_inspection_fprintf(stdout, "Disconnecting (connect, fd=%d)\n", s_session->m_connect_socket);
+		if(s_main_context->m_is_verbose >= 2) {
+			(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s Disconnecting (%sS-fd=%d%s)\n", sg_co_c, s_accept_fd, sg_co_n, sg_co_y, s_session->m_connect_socket, sg_co_n);
 		}
 
 		(void)shutdown(s_session->m_connect_socket, SHUT_RDWR);
 
 		s_check = SSL_inspection_closesocket(s_session->m_connect_socket);
 		if(SSL_inspection_unlikely(s_check == (-1))) {
-			(void)SSL_inspection_fprintf(
-				stderr,
-				"close connect socket ! : %s (fd=%d)\n",
-				strerror(errno),
-				s_session->m_connect_socket
-			);
+			(void)SSL_inspection_fprintf(stderr,
+				"%s[C-fd=%d]%s %sclose %sS-fd=%d%s socket failed%s: %s\n",
+				sg_ce_c, s_accept_fd, sg_ce_n, sg_ce_r, sg_ce_y, s_session->m_connect_socket, sg_ce_r, sg_ce_n, strerror(errno));
 		}
 		s_session->m_connect_socket = (-1);
 		s_session->m_flags &= (~def_SSL_inspection_session_flag_connected);
@@ -266,6 +328,7 @@ SSL_inspection_session_t *SSL_inspection_free_session(SSL_inspection_session_t *
 
 	free((void *)s_session);
 
+	} /* s_accept_fd scope */
 	return((SSL_inspection_session_t *)(NULL));
 }
 
@@ -627,6 +690,884 @@ static int SSL_inspection_session_peek_sni(SSL_inspection_session_t *s_session)
 	return(1); /* no SNI extension found */
 }
 
+/* =========================================================================
+ * 2-tier SNI certificate cache
+ * =========================================================================
+ *
+ * Tier-1: per-worker local LRU (lock-free, max def_ssl_cert_cache_local_max_entries)
+ * Tier-2: global hash-table + LRU protected by pthread_rwlock_t
+ *           (max def_ssl_cert_cache_global_max_entries)
+ *
+ * Cache key  : normalized SNI (lowercase, trailing dot stripped)
+ * Cache value: (X509 *, EVP_PKEY *) – OpenSSL-refcounted leaf cert + key
+ *
+ * Ref-counting contract
+ * ---------------------
+ *  Every handout from a lookup calls X509_up_ref / EVP_PKEY_up_ref.
+ *  The caller is responsible for X509_free / EVP_PKEY_free when done.
+ *  SSL_CTX_use_certificate / SSL_CTX_use_PrivateKey increment internally,
+ *  so the caller's ref can be freed immediately after those calls.
+ *  SSL_CTX_add_extra_chain_cert TAKES ownership; caller must up_ref first.
+ *
+ * Thundering-herd protection
+ * --------------------------
+ *  ssl_cert_cache_global_store() takes a write-lock and re-checks before
+ *  inserting.  The winner's cert is returned via out_cert/out_pkey with an
+ *  extra up_ref; the caller must free the candidate it generated.
+ * ========================================================================= */
+
+/* FNV-1a 32-bit hash */
+static uint32_t ssl_cert_cache_fnv1a(const char *s)
+{
+	uint32_t h = 2166136261u;
+	for (; *s; ++s) {
+		h ^= (uint32_t)(unsigned char)*s;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+/* Normalize SNI: lowercase + strip single trailing dot.
+ * Returns 0 on success, -1 if src is empty or too long. */
+static int ssl_cert_cache_normalize_sni(char *dst, size_t dst_size, const char *src)
+{
+	size_t len;
+	size_t i;
+
+	if ((src == NULL) || (src[0] == '\0')) return -1;
+	len = strlen(src);
+	if (len == 0u || len >= dst_size) return -1;
+	/* strip trailing dot (DNS FQDN) */
+	if ((len > 1u) && (src[len - 1u] == '.')) --len;
+	if (len == 0u || len >= dst_size) return -1;
+	for (i = 0u; i < len; ++i)
+		dst[i] = (char)tolower((unsigned char)src[i]);
+	dst[len] = '\0';
+	return 0;
+}
+
+/* --- LRU helpers (shared by local and global, different struct layouts) --- */
+
+/* Global LRU unlink */
+static void ssl_cert_cache_global_lru_unlink(ssl_cert_cache_global_t *g, ssl_cert_cache_entry_t *e)
+{
+	if (e->m_lru_prev != NULL) e->m_lru_prev->m_lru_next = e->m_lru_next;
+	else                       g->m_lru_head              = e->m_lru_next;
+	if (e->m_lru_next != NULL) e->m_lru_next->m_lru_prev = e->m_lru_prev;
+	else                       g->m_lru_tail              = e->m_lru_prev;
+	e->m_lru_prev = e->m_lru_next = NULL;
+}
+
+static void ssl_cert_cache_global_lru_push_front(ssl_cert_cache_global_t *g, ssl_cert_cache_entry_t *e)
+{
+	e->m_lru_prev = NULL;
+	e->m_lru_next = g->m_lru_head;
+	if (g->m_lru_head != NULL) g->m_lru_head->m_lru_prev = e;
+	else                       g->m_lru_tail              = e;
+	g->m_lru_head = e;
+}
+
+/* Local LRU unlink */
+static void ssl_cert_cache_local_lru_unlink(ssl_cert_cache_local_t *l, ssl_cert_cache_entry_t *e)
+{
+	if (e->m_lru_prev != NULL) e->m_lru_prev->m_lru_next = e->m_lru_next;
+	else                       l->m_lru_head              = e->m_lru_next;
+	if (e->m_lru_next != NULL) e->m_lru_next->m_lru_prev = e->m_lru_prev;
+	else                       l->m_lru_tail              = e->m_lru_prev;
+	e->m_lru_prev = e->m_lru_next = NULL;
+}
+
+static void ssl_cert_cache_local_lru_push_front(ssl_cert_cache_local_t *l, ssl_cert_cache_entry_t *e)
+{
+	e->m_lru_prev = NULL;
+	e->m_lru_next = l->m_lru_head;
+	if (l->m_lru_head != NULL) l->m_lru_head->m_lru_prev = e;
+	else                       l->m_lru_tail              = e;
+	l->m_lru_head = e;
+}
+
+/* --- Entry alloc / free --- */
+
+static ssl_cert_cache_entry_t *ssl_cert_cache_entry_new(
+	const char *sni, uint32_t hash, X509 *cert, EVP_PKEY *pkey, time_t expiry)
+{
+	ssl_cert_cache_entry_t *e = (ssl_cert_cache_entry_t *)malloc(sizeof(ssl_cert_cache_entry_t));
+	if (SSL_inspection_unlikely(e == NULL)) return NULL;
+	(void)memset(e, 0, sizeof(*e));
+	/* sni is already normalized and fits in m_sni (caller guarantees length < 256) */
+	(void)memcpy(e->m_sni, sni, strlen(sni) + 1u);
+	e->m_hash   = hash;
+	e->m_expiry = expiry;
+	/* Take ownership of one ref each */
+	X509_up_ref(cert);
+	EVP_PKEY_up_ref(pkey);
+	e->m_cert = cert;
+	e->m_pkey = pkey;
+	return e;
+}
+
+static void ssl_cert_cache_entry_free(ssl_cert_cache_entry_t *e)
+{
+	if (e == NULL) return;
+	if (e->m_cert != NULL) { X509_free(e->m_cert);     e->m_cert = NULL; }
+	if (e->m_pkey != NULL) { EVP_PKEY_free(e->m_pkey); e->m_pkey = NULL; }
+	free(e);
+}
+
+/* --- Global cache --- */
+
+static ssl_cert_cache_global_t *ssl_cert_cache_global_create(size_t max_count)
+{
+	ssl_cert_cache_global_t *g = (ssl_cert_cache_global_t *)malloc(sizeof(ssl_cert_cache_global_t));
+	if (SSL_inspection_unlikely(g == NULL)) return NULL;
+	(void)memset(g, 0, sizeof(*g));
+	g->m_max_count = max_count;
+	if (SSL_inspection_unlikely(pthread_rwlock_init(&g->m_rwlock, NULL) != 0)) {
+		free(g);
+		return NULL;
+	}
+	return g;
+}
+
+static void ssl_cert_cache_global_destroy(ssl_cert_cache_global_t *g)
+{
+	ssl_cert_cache_entry_t *e, *next;
+	if (g == NULL) return;
+	/* No lock needed: called only after all workers have joined */
+	for (e = g->m_lru_head; e != NULL; e = next) {
+		next = e->m_lru_next;
+		ssl_cert_cache_entry_free(e);
+	}
+	(void)pthread_rwlock_destroy(&g->m_rwlock);
+	free(g);
+}
+
+/* Returns 1 and fills out_cert/out_pkey (each with an extra up_ref) on hit.
+ * Returns 0 on miss.  Does NOT update LRU (avoids write on read path). */
+static int ssl_cert_cache_global_lookup(
+	ssl_cert_cache_global_t *g, const char *sni,
+	X509 **out_cert, EVP_PKEY **out_pkey)
+{
+	uint32_t hash;
+	uint32_t bucket;
+	ssl_cert_cache_entry_t *e;
+	time_t now;
+
+	if (g == NULL) return 0;
+	hash   = ssl_cert_cache_fnv1a(sni);
+	bucket = hash & (def_ssl_cert_cache_global_bucket_count - 1u);
+	now    = time(NULL);
+
+	int s_expired_found = 0;
+	(void)pthread_rwlock_rdlock(&g->m_rwlock);
+	for (e = g->m_buckets[bucket]; e != NULL; e = e->m_hash_next) {
+		if ((e->m_hash == hash) && (strcmp(e->m_sni, sni) == 0)) {
+			if (e->m_expiry <= now) { s_expired_found = 1; break; }
+			X509_up_ref(e->m_cert);
+			EVP_PKEY_up_ref(e->m_pkey);
+			*out_cert = e->m_cert;
+			*out_pkey = e->m_pkey;
+			(void)pthread_rwlock_unlock(&g->m_rwlock);
+			return 1;
+		}
+	}
+	(void)pthread_rwlock_unlock(&g->m_rwlock);
+
+	/* Remove stale entry eagerly under write lock to prevent accumulation.
+	 * Re-traverse to handle races: another thread may have refreshed it. */
+	if (s_expired_found) {
+		(void)pthread_rwlock_wrlock(&g->m_rwlock);
+		for (e = g->m_buckets[bucket]; e != NULL; e = e->m_hash_next) {
+			if ((e->m_hash == hash) && (strcmp(e->m_sni, sni) == 0) &&
+			    e->m_expiry <= now) {
+				if (e->m_hash_prev != NULL) e->m_hash_prev->m_hash_next = e->m_hash_next;
+				else                        g->m_buckets[bucket]         = e->m_hash_next;
+				if (e->m_hash_next != NULL) e->m_hash_next->m_hash_prev = e->m_hash_prev;
+				ssl_cert_cache_global_lru_unlink(g, e);
+				ssl_cert_cache_entry_free(e);
+				--g->m_count;
+				break;
+			}
+		}
+		(void)pthread_rwlock_unlock(&g->m_rwlock);
+	}
+	return 0;
+}
+
+/* Insert (cert, pkey) for sni.
+ *
+ * Handles thundering herd: takes write-lock then re-checks.
+ * If another worker already inserted:
+ *   - discards (cert, pkey) passed by caller
+ *   - fills out_cert/out_pkey with winner's cert (up_ref'd)
+ * If this worker wins:
+ *   - inserts entry (entry holds one ref via ssl_cert_cache_entry_new)
+ *   - fills out_cert/out_pkey with another up_ref for caller to use
+ * Evicts LRU tail if cache is full (expired entries evicted first).
+ *
+ * Returns 1 = winner (we inserted), 0 = loser (someone beat us).
+ * In both cases *out_cert and *out_pkey are valid and caller must free them. */
+static int ssl_cert_cache_global_store(
+	ssl_cert_cache_global_t *g, const char *sni,
+	X509 *cert, EVP_PKEY *pkey, time_t expiry,
+	X509 **out_cert, EVP_PKEY **out_pkey)
+{
+	uint32_t hash;
+	uint32_t bucket;
+	ssl_cert_cache_entry_t *e, *evict;
+	time_t now;
+
+	if (g == NULL) {
+		/* No cache: caller uses the cert they generated */
+		X509_up_ref(cert); EVP_PKEY_up_ref(pkey);
+		*out_cert = cert; *out_pkey = pkey;
+		return 1;
+	}
+
+	hash   = ssl_cert_cache_fnv1a(sni);
+	bucket = hash & (def_ssl_cert_cache_global_bucket_count - 1u);
+	now    = time(NULL);
+
+	(void)pthread_rwlock_wrlock(&g->m_rwlock);
+
+	/* Re-check: another worker may have inserted while we were generating */
+	for (e = g->m_buckets[bucket]; e != NULL; e = e->m_hash_next) {
+		if ((e->m_hash == hash) && (strcmp(e->m_sni, sni) == 0)) {
+			if (e->m_expiry > now) {
+				/* Winner exists: return their cert, caller frees own cert */
+				X509_up_ref(e->m_cert);
+				EVP_PKEY_up_ref(e->m_pkey);
+				*out_cert = e->m_cert;
+				*out_pkey = e->m_pkey;
+				(void)pthread_rwlock_unlock(&g->m_rwlock);
+				return 0;
+			}
+			/* Expired entry for same SNI: remove it before inserting fresh one */
+			if (e->m_hash_prev != NULL) e->m_hash_prev->m_hash_next = e->m_hash_next;
+			else                        g->m_buckets[bucket]         = e->m_hash_next;
+			if (e->m_hash_next != NULL) e->m_hash_next->m_hash_prev = e->m_hash_prev;
+			ssl_cert_cache_global_lru_unlink(g, e);
+			ssl_cert_cache_entry_free(e);
+			--g->m_count;
+			break;
+		}
+	}
+
+	/* Evict LRU tail (prefer expired) if at capacity */
+	if (g->m_count >= g->m_max_count) {
+		/* First pass: prefer an expired entry anywhere in the tail half */
+		evict = g->m_lru_tail;
+		if (evict == NULL) evict = g->m_lru_head; /* should not happen */
+		if (evict != NULL) {
+			uint32_t evict_bucket = evict->m_hash & (def_ssl_cert_cache_global_bucket_count - 1u);
+			if (evict->m_hash_prev != NULL) evict->m_hash_prev->m_hash_next = evict->m_hash_next;
+			else                            g->m_buckets[evict_bucket]       = evict->m_hash_next;
+			if (evict->m_hash_next != NULL) evict->m_hash_next->m_hash_prev = evict->m_hash_prev;
+			ssl_cert_cache_global_lru_unlink(g, evict);
+			ssl_cert_cache_entry_free(evict);
+			--g->m_count;
+		}
+	}
+
+	/* Insert new entry */
+	e = ssl_cert_cache_entry_new(sni, hash, cert, pkey, expiry);
+	if (SSL_inspection_unlikely(e == NULL)) {
+		/* OOM: return caller's cert with extra up_ref */
+		X509_up_ref(cert); EVP_PKEY_up_ref(pkey);
+		*out_cert = cert; *out_pkey = pkey;
+		(void)pthread_rwlock_unlock(&g->m_rwlock);
+		return 1;
+	}
+	/* Link into bucket chain */
+	e->m_hash_next = g->m_buckets[bucket];
+	e->m_hash_prev = NULL;
+	if (g->m_buckets[bucket] != NULL) g->m_buckets[bucket]->m_hash_prev = e;
+	g->m_buckets[bucket] = e;
+	ssl_cert_cache_global_lru_push_front(g, e);
+	++g->m_count;
+
+	/* Return cert to caller with an extra up_ref (entry already holds one) */
+	X509_up_ref(cert); EVP_PKEY_up_ref(pkey);
+	*out_cert = cert; *out_pkey = pkey;
+
+	(void)pthread_rwlock_unlock(&g->m_rwlock);
+	return 1;
+}
+
+/* --- Local (per-worker) cache --- */
+
+static void ssl_cert_cache_local_init(ssl_cert_cache_local_t *l)
+{
+	(void)memset(l, 0, sizeof(*l));
+}
+
+static void ssl_cert_cache_local_destroy(ssl_cert_cache_local_t *l)
+{
+	ssl_cert_cache_entry_t *e, *next;
+	if (l == NULL) return;
+	for (e = l->m_lru_head; e != NULL; e = next) {
+		next = e->m_lru_next;
+		ssl_cert_cache_entry_free(e);
+	}
+	(void)memset(l, 0, sizeof(*l));
+}
+
+/* Returns 1 on hit (fills out_cert/out_pkey with up_ref'd pointers), 0 on miss. */
+static int ssl_cert_cache_local_lookup(
+	ssl_cert_cache_local_t *l, const char *sni,
+	X509 **out_cert, EVP_PKEY **out_pkey)
+{
+	uint32_t hash;
+	uint32_t bucket;
+	ssl_cert_cache_entry_t *e;
+	time_t now;
+
+	hash   = ssl_cert_cache_fnv1a(sni);
+	bucket = hash & (def_ssl_cert_cache_local_bucket_count - 1u);
+	now    = time(NULL);
+
+	for (e = l->m_buckets[bucket]; e != NULL; e = e->m_hash_next) {
+		if ((e->m_hash == hash) && (strcmp(e->m_sni, sni) == 0)) {
+			if (e->m_expiry <= now) {
+				/* Expired: evict lazily */
+				if (e->m_hash_prev != NULL) e->m_hash_prev->m_hash_next = e->m_hash_next;
+				else                        l->m_buckets[bucket]         = e->m_hash_next;
+				if (e->m_hash_next != NULL) e->m_hash_next->m_hash_prev = e->m_hash_prev;
+				ssl_cert_cache_local_lru_unlink(l, e);
+				ssl_cert_cache_entry_free(e);
+				--l->m_count;
+				return 0;
+			}
+			/* Promote to LRU front */
+			ssl_cert_cache_local_lru_unlink(l, e);
+			ssl_cert_cache_local_lru_push_front(l, e);
+			X509_up_ref(e->m_cert);
+			EVP_PKEY_up_ref(e->m_pkey);
+			*out_cert = e->m_cert;
+			*out_pkey = e->m_pkey;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void ssl_cert_cache_local_store(
+	ssl_cert_cache_local_t *l, const char *sni,
+	X509 *cert, EVP_PKEY *pkey, time_t expiry)
+{
+	uint32_t hash;
+	uint32_t bucket;
+	ssl_cert_cache_entry_t *e;
+
+	hash   = ssl_cert_cache_fnv1a(sni);
+	bucket = hash & (def_ssl_cert_cache_local_bucket_count - 1u);
+
+	/* Evict LRU tail if full */
+	if (l->m_count >= def_ssl_cert_cache_local_max_entries) {
+		ssl_cert_cache_entry_t *evict = l->m_lru_tail;
+		if (evict != NULL) {
+			uint32_t evict_bucket = evict->m_hash & (def_ssl_cert_cache_local_bucket_count - 1u);
+			if (evict->m_hash_prev != NULL) evict->m_hash_prev->m_hash_next = evict->m_hash_next;
+			else                            l->m_buckets[evict_bucket]       = evict->m_hash_next;
+			if (evict->m_hash_next != NULL) evict->m_hash_next->m_hash_prev = evict->m_hash_prev;
+			ssl_cert_cache_local_lru_unlink(l, evict);
+			ssl_cert_cache_entry_free(evict);
+			--l->m_count;
+		}
+	}
+
+	e = ssl_cert_cache_entry_new(sni, hash, cert, pkey, expiry);
+	if (SSL_inspection_unlikely(e == NULL)) return;
+
+	e->m_hash_next = l->m_buckets[bucket];
+	e->m_hash_prev = NULL;
+	if (l->m_buckets[bucket] != NULL) l->m_buckets[bucket]->m_hash_prev = e;
+	l->m_buckets[bucket] = e;
+	ssl_cert_cache_local_lru_push_front(l, e);
+	++l->m_count;
+}
+
+/* =========================================================================
+ * CA setup and leaf certificate generation
+ * =========================================================================
+ *
+ * ssl_inspection_setup_ca():
+ *   Called once at startup (before SSL_inspection_new_SSL_CTX for m_ssl_ctx).
+ *   Loads or generates the CA key, then builds a self-signed CA cert.
+ *   Stores results in main_context->m_ca_pkey and m_ca_x509.
+ *   Also allocates main_context->m_cert_cache.
+ *
+ * ssl_inspection_generate_leaf_cert():
+ *   Generates a fresh ECDSA P-256 leaf key pair, builds an X.509 cert
+ *   signed by the CA key.  Adds SubjectAltName DNS:<sni> for RFC 5280
+ *   compliance.  Caller owns the returned (X509 *, EVP_PKEY *) references.
+ *
+ * ssl_inspection_get_or_create_sni_ssl_ctx():
+ *   Cache-aware wrapper for per-SNI SSL_CTX creation.
+ *   Local hit  → use cached cert directly.
+ *   Global hit → promote to local, use cached cert.
+ *   Miss       → generate, global-store (thundering-herd safe), local-store.
+ * ========================================================================= */
+
+static int ssl_inspection_setup_ca(SSL_inspection_main_context_t *s_main_context)
+{
+	EVP_PKEY *s_ca_pkey = NULL;
+	X509     *s_ca_x509 = NULL;
+	X509_NAME *s_name;
+	X509_EXTENSION *s_ext;
+	int s_check;
+
+	/* --- Generate or load CA private key --- */
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+	if (s_main_context->m_privatekey_pathname != NULL) {
+		BIO *s_bio = BIO_new_file(s_main_context->m_privatekey_pathname, "rb");
+		if (SSL_inspection_unlikely(s_bio == NULL)) {
+			(void)SSL_inspection_fprintf(stderr, "CA: BIO_new_file failed (\"%s\")\n",
+				s_main_context->m_privatekey_pathname);
+			return -1;
+		}
+		s_ca_pkey = PEM_read_bio_PrivateKey(s_bio, NULL, NULL, NULL);
+		BIO_free(s_bio);
+	} else {
+		s_ca_pkey = EVP_EC_gen(SN_X9_62_prime256v1);
+	}
+#else
+	if (s_main_context->m_privatekey_pathname != NULL) {
+		FILE *s_fp = fopen(s_main_context->m_privatekey_pathname, "rb");
+		if (SSL_inspection_unlikely(s_fp == NULL)) {
+			(void)SSL_inspection_fprintf(stderr, "CA: key file open failed (\"%s\")\n",
+				s_main_context->m_privatekey_pathname);
+			return -1;
+		}
+		s_ca_pkey = PEM_read_PrivateKey(s_fp, NULL, NULL, NULL);
+		(void)fclose(s_fp);
+	} else {
+		EC_KEY *s_ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+		if (SSL_inspection_unlikely(s_ec == NULL || EC_KEY_generate_key(s_ec) != 1)) {
+			if (s_ec != NULL) EC_KEY_free(s_ec);
+			(void)SSL_inspection_fprintf(stderr, "CA: EC key generation failed\n");
+			return -1;
+		}
+		EC_KEY_set_asn1_flag(s_ec, OPENSSL_EC_NAMED_CURVE);
+		s_ca_pkey = EVP_PKEY_new();
+		if (SSL_inspection_unlikely(s_ca_pkey == NULL || EVP_PKEY_assign_EC_KEY(s_ca_pkey, s_ec) == 0)) {
+			EC_KEY_free(s_ec);
+			if (s_ca_pkey != NULL) { EVP_PKEY_free(s_ca_pkey); s_ca_pkey = NULL; }
+			(void)SSL_inspection_fprintf(stderr, "CA: EVP_PKEY_assign_EC_KEY failed\n");
+			return -1;
+		}
+	}
+#endif
+	if (SSL_inspection_unlikely(s_ca_pkey == NULL)) {
+		(void)SSL_inspection_fprintf(stderr, "CA: private key load/generate failed\n");
+		return -1;
+	}
+
+	/* --- Build self-signed CA certificate --- */
+	s_ca_x509 = X509_new();
+	if (SSL_inspection_unlikely(s_ca_x509 == NULL)) {
+		(void)SSL_inspection_fprintf(stderr, "CA: X509_new failed\n");
+		EVP_PKEY_free(s_ca_pkey);
+		return -1;
+	}
+
+	/* Serial: random 128-bit positive integer */
+	do {
+		unsigned char s_buf[16];
+		BIGNUM *s_bn;
+		if (RAND_bytes(s_buf, (int)sizeof(s_buf)) != 1) {
+			s_buf[0] = 0x01;
+			(void)memset(s_buf + 1, 0xca, sizeof(s_buf) - 1);
+		}
+		s_buf[0] &= 0x7Fu;
+		s_bn = BN_bin2bn(s_buf, (int)sizeof(s_buf), NULL);
+		if (s_bn != NULL) {
+			(void)BN_to_ASN1_INTEGER(s_bn, X509_get_serialNumber(s_ca_x509));
+			BN_free(s_bn);
+		}
+	} while (0);
+
+	(void)X509_set_version(s_ca_x509, 2L);  /* v3 */
+
+	/* Validity: -24 h to +10 years */
+	(void)X509_gmtime_adj(X509_get_notBefore(s_ca_x509), -86400L);
+	(void)X509_gmtime_adj(X509_get_notAfter(s_ca_x509),  86400L * 3650L);
+
+	/* Subject / Issuer (same for self-signed) */
+	s_name = X509_get_subject_name(s_ca_x509);
+	(void)X509_NAME_add_entry_by_txt(s_name, "CN", MBSTRING_ASC,
+		(const unsigned char *)"SSL Inspection Proxy CA", -1, -1, 0);
+	(void)X509_NAME_add_entry_by_txt(s_name, "O",  MBSTRING_ASC,
+		(const unsigned char *)"SSL-Inspection", -1, -1, 0);
+	(void)X509_set_issuer_name(s_ca_x509, s_name);
+
+	/* Public key */
+	(void)X509_set_pubkey(s_ca_x509, s_ca_pkey);
+
+	/* BasicConstraints: critical, CA:true, pathLen:0 */
+	s_ext = X509V3_EXT_conf_nid(NULL, NULL, NID_basic_constraints,
+		"critical,CA:true,pathlen:0");
+	if (s_ext != NULL) {
+		(void)X509_add_ext(s_ca_x509, s_ext, -1);
+		X509_EXTENSION_free(s_ext);
+	}
+
+	/* KeyUsage: critical, keyCertSign, cRLSign */
+	s_ext = X509V3_EXT_conf_nid(NULL, NULL, NID_key_usage,
+		"critical,keyCertSign,cRLSign");
+	if (s_ext != NULL) {
+		(void)X509_add_ext(s_ca_x509, s_ext, -1);
+		X509_EXTENSION_free(s_ext);
+	}
+
+	/* SubjectKeyIdentifier */
+	s_ext = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_key_identifier, "hash");
+	if (s_ext != NULL) {
+		(void)X509_add_ext(s_ca_x509, s_ext, -1);
+		X509_EXTENSION_free(s_ext);
+	}
+
+	/* Self-sign */
+	s_check = X509_sign(s_ca_x509, s_ca_pkey, EVP_sha256());
+	if (SSL_inspection_unlikely(s_check == 0)) {
+		ERR_print_errors_fp(stderr);
+		(void)SSL_inspection_fprintf(stderr, "CA: X509_sign failed\n");
+		X509_free(s_ca_x509);
+		EVP_PKEY_free(s_ca_pkey);
+		return -1;
+	}
+
+	/* --- Allocate global cert cache --- */
+	s_main_context->m_cert_cache = ssl_cert_cache_global_create(
+		(size_t)def_ssl_cert_cache_global_max_entries);
+	if (SSL_inspection_unlikely(s_main_context->m_cert_cache == NULL)) {
+		(void)SSL_inspection_fprintf(stderr, "CA: cert cache alloc failed\n");
+		X509_free(s_ca_x509);
+		EVP_PKEY_free(s_ca_pkey);
+		return -1;
+	}
+
+	s_main_context->m_ca_pkey = s_ca_pkey;
+	s_main_context->m_ca_x509 = s_ca_x509;
+
+	if (s_main_context->m_is_verbose >= 1) {
+		(void)SSL_inspection_fprintf(stdout,
+			"CA: %s ECDSA P-256 key, cert cache ready (%u buckets)\n",
+			(s_main_context->m_privatekey_pathname != NULL) ? "loaded" : "generated",
+			(unsigned)def_ssl_cert_cache_global_max_entries);
+	}
+	return 0;
+}
+
+/* Generate a leaf cert for sni, signed by the CA.
+ *
+ * The leaf cert includes:
+ *   - Subject CN = sni
+ *   - SubjectAltName DNS:sni  (required by RFC 5280 / modern browsers)
+ *   - Issuer copied from CA cert's subject
+ *   - BasicConstraints CA:false (critical)
+ *   - Signed by m_ca_pkey
+ *
+ * Returns 0 on success.  *out_cert and *out_pkey are caller-owned (refcount=1). */
+static int ssl_inspection_generate_leaf_cert(
+	SSL_inspection_main_context_t *s_main_context, const char *s_sni,
+	X509 **out_cert, EVP_PKEY **out_pkey)
+{
+	EVP_PKEY *s_leaf_pkey = NULL;
+	X509     *s_leaf_x509 = NULL;
+	X509_NAME *s_subject;
+	X509_EXTENSION *s_ext;
+	char s_san_str[272]; /* "DNS:" + max 255-char SNI + NUL */
+	int s_check;
+
+	/* Generate fresh ECDSA P-256 leaf key */
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+	s_leaf_pkey = EVP_EC_gen(SN_X9_62_prime256v1);
+#else
+	do {
+		EC_KEY *s_ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+		if (SSL_inspection_unlikely(s_ec == NULL)) break;
+		EC_KEY_set_asn1_flag(s_ec, OPENSSL_EC_NAMED_CURVE);
+		if (SSL_inspection_unlikely(EC_KEY_generate_key(s_ec) != 1)) { EC_KEY_free(s_ec); break; }
+		s_leaf_pkey = EVP_PKEY_new();
+		if (SSL_inspection_unlikely(s_leaf_pkey == NULL || EVP_PKEY_assign_EC_KEY(s_leaf_pkey, s_ec) == 0)) {
+			EC_KEY_free(s_ec);
+			if (s_leaf_pkey != NULL) { EVP_PKEY_free(s_leaf_pkey); s_leaf_pkey = NULL; }
+		}
+	} while (0);
+#endif
+	if (SSL_inspection_unlikely(s_leaf_pkey == NULL)) {
+		(void)SSL_inspection_fprintf(stderr, "leaf cert: leaf key generation failed (sni=\"%s\")\n", s_sni);
+		return -1;
+	}
+
+	s_leaf_x509 = X509_new();
+	if (SSL_inspection_unlikely(s_leaf_x509 == NULL)) {
+		(void)SSL_inspection_fprintf(stderr, "leaf cert: X509_new failed\n");
+		EVP_PKEY_free(s_leaf_pkey);
+		return -1;
+	}
+
+	(void)X509_set_version(s_leaf_x509, 2L); /* v3 */
+
+	/* Random 128-bit positive serial */
+	do {
+		unsigned char s_buf[16];
+		BIGNUM *s_bn;
+		if (RAND_bytes(s_buf, (int)sizeof(s_buf)) != 1) {
+			s_buf[0] = 0x01;
+			(void)memset(s_buf + 1, 0xab, sizeof(s_buf) - 1);
+		}
+		s_buf[0] &= 0x7Fu;
+		s_bn = BN_bin2bn(s_buf, (int)sizeof(s_buf), NULL);
+		if (s_bn != NULL) {
+			(void)BN_to_ASN1_INTEGER(s_bn, X509_get_serialNumber(s_leaf_x509));
+			BN_free(s_bn);
+		}
+	} while (0);
+
+	/* Validity: -24 h to +2 years */
+	(void)X509_gmtime_adj(X509_get_notBefore(s_leaf_x509), -86400L);
+	(void)X509_gmtime_adj(X509_get_notAfter(s_leaf_x509),
+		(long)def_ssl_cert_cache_leaf_validity_secs);
+
+	/* Subject: CN = sni */
+	s_subject = X509_get_subject_name(s_leaf_x509);
+	(void)X509_NAME_add_entry_by_txt(s_subject, "CN", MBSTRING_ASC,
+		(const unsigned char *)s_sni, -1, -1, 0);
+
+	/* Issuer: copy from CA cert's subject */
+	(void)X509_set_issuer_name(s_leaf_x509,
+		X509_get_subject_name(s_main_context->m_ca_x509));
+
+	/* Public key = fresh leaf key */
+	(void)X509_set_pubkey(s_leaf_x509, s_leaf_pkey);
+
+	/* SubjectAltName DNS:<sni>  — required by RFC 5280 §4.2.1.6 */
+	(void)snprintf(s_san_str, sizeof(s_san_str), "DNS:%s", s_sni);
+	s_ext = X509V3_EXT_conf_nid(NULL, NULL, NID_subject_alt_name, s_san_str);
+	if (s_ext != NULL) {
+		(void)X509_add_ext(s_leaf_x509, s_ext, -1);
+		X509_EXTENSION_free(s_ext);
+	}
+
+	/* BasicConstraints: critical, CA:false */
+	s_ext = X509V3_EXT_conf_nid(NULL, NULL, NID_basic_constraints, "critical,CA:false");
+	if (s_ext != NULL) {
+		(void)X509_add_ext(s_leaf_x509, s_ext, -1);
+		X509_EXTENSION_free(s_ext);
+	}
+
+	/* ExtendedKeyUsage: serverAuth */
+	s_ext = X509V3_EXT_conf_nid(NULL, NULL, NID_ext_key_usage, "serverAuth");
+	if (s_ext != NULL) {
+		(void)X509_add_ext(s_leaf_x509, s_ext, -1);
+		X509_EXTENSION_free(s_ext);
+	}
+
+	/* Sign with CA key — this is what makes it a real MITM cert */
+	s_check = X509_sign(s_leaf_x509, s_main_context->m_ca_pkey, EVP_sha256());
+	if (SSL_inspection_unlikely(s_check == 0)) {
+		ERR_print_errors_fp(stderr);
+		(void)SSL_inspection_fprintf(stderr, "leaf cert: X509_sign failed (sni=\"%s\")\n", s_sni);
+		X509_free(s_leaf_x509);
+		EVP_PKEY_free(s_leaf_pkey);
+		return -1;
+	}
+
+	*out_cert = s_leaf_x509;
+	*out_pkey = s_leaf_pkey;
+	return 0;
+}
+
+/* Create an SSL_CTX for the accept (server) side using a pre-built cert+key.
+ * Applies the same options/ciphers/session-cache as SSL_inspection_new_SSL_CTX.
+ * Adds m_ca_x509 as an extra chain cert so the client can build the trust chain.
+ * Returns NULL on failure.  Caller must SSL_CTX_free() when done. */
+static SSL_CTX *ssl_inspection_create_accept_ssl_ctx(
+	SSL_inspection_main_context_t *s_main_context,
+	X509 *s_cert, EVP_PKEY *s_pkey)
+{
+	SSL_CTX *s_ssl_ctx;
+	int s_check;
+
+	s_ssl_ctx = SSL_CTX_new(s_main_context->m_server_ssl_method);
+	if (SSL_inspection_unlikely(s_ssl_ctx == NULL)) return NULL;
+
+	if (s_main_context->m_use_async > 0)
+		(void)SSL_CTX_set_mode(s_ssl_ctx, SSL_MODE_ASYNC);
+	(void)SSL_CTX_set_mode(s_ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
+	(void)SSL_CTX_set_mode(s_ssl_ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+	(void)SSL_CTX_set_options(s_ssl_ctx, s_main_context->m_ssl_options);
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+	if (s_main_context->m_use_ktls > 0)
+		(void)SSL_CTX_set_options(s_ssl_ctx, SSL_OP_ENABLE_KTLS);
+#endif
+	(void)SSL_CTX_set_ecdh_auto(s_ssl_ctx, 1);
+	(void)SSL_CTX_set_dh_auto(s_ssl_ctx, 1);
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+	(void)SSL_CTX_set_min_proto_version(s_ssl_ctx, TLS1_2_VERSION);
+	(void)SSL_CTX_set_max_proto_version(s_ssl_ctx, TLS1_3_VERSION);
+#endif
+
+	if (s_main_context->m_cipher_list != NULL) {
+		s_check = SSL_CTX_set_cipher_list(s_ssl_ctx, s_main_context->m_cipher_list);
+		if (SSL_inspection_unlikely(s_check <= 0)) {
+			ERR_print_errors_fp(stderr);
+			SSL_CTX_free(s_ssl_ctx);
+			return NULL;
+		}
+	}
+
+	/* Leaf certificate */
+	s_check = SSL_CTX_use_certificate(s_ssl_ctx, s_cert);
+	if (SSL_inspection_unlikely(s_check <= 0)) {
+		ERR_print_errors_fp(stderr);
+		(void)SSL_inspection_fprintf(stderr, "sni ctx: SSL_CTX_use_certificate failed\n");
+		SSL_CTX_free(s_ssl_ctx);
+		return NULL;
+	}
+
+	/* Leaf private key */
+	s_check = SSL_CTX_use_PrivateKey(s_ssl_ctx, s_pkey);
+	if (SSL_inspection_unlikely(s_check <= 0)) {
+		ERR_print_errors_fp(stderr);
+		(void)SSL_inspection_fprintf(stderr, "sni ctx: SSL_CTX_use_PrivateKey failed\n");
+		SSL_CTX_free(s_ssl_ctx);
+		return NULL;
+	}
+
+	s_check = SSL_CTX_check_private_key(s_ssl_ctx);
+	if (SSL_inspection_unlikely(s_check <= 0)) {
+		ERR_print_errors_fp(stderr);
+		(void)SSL_inspection_fprintf(stderr, "sni ctx: SSL_CTX_check_private_key failed\n");
+		SSL_CTX_free(s_ssl_ctx);
+		return NULL;
+	}
+
+	/* Add CA cert to chain so clients can validate the leaf cert.
+	 * SSL_CTX_add_extra_chain_cert takes ownership ONLY on success.
+	 * On failure the ref we up_ref'd must be released explicitly. */
+	if (s_main_context->m_ca_x509 != NULL) {
+		X509_up_ref(s_main_context->m_ca_x509);
+		s_check = (int)SSL_CTX_add_extra_chain_cert(s_ssl_ctx, s_main_context->m_ca_x509);
+		if (SSL_inspection_unlikely(s_check <= 0)) {
+			ERR_print_errors_fp(stderr);
+			X509_free(s_main_context->m_ca_x509); /* release our ref — ownership not transferred */
+		}
+	}
+
+	SSL_CTX_set_session_cache_mode(s_ssl_ctx, SSL_SESS_CACHE_SERVER);
+	SSL_CTX_set_timeout(s_ssl_ctx, 3600L);
+
+	return s_ssl_ctx;
+}
+
+/* Cache-aware per-SNI SSL_CTX factory.
+ *
+ * Order of operations:
+ *  1. Normalize SNI
+ *  2. Tier-1 local cache lookup (no lock, fast path)
+ *  3. Tier-2 global cache lookup (rdlock)
+ *  4. Miss: generate leaf cert, global-store with thundering-herd guard,
+ *           local-store
+ *  5. Create SSL_CTX with the resolved cert+key, free caller refs
+ *
+ * Returns a ready SSL_CTX or NULL on error. */
+static SSL_CTX *ssl_inspection_get_or_create_sni_ssl_ctx(
+	SSL_inspection_main_context_t *s_main_context,
+	SSL_inspection_worker_context_t *s_worker_context,
+	int s_accept_fd,
+	const char *s_sni_raw)
+{
+	(void)s_accept_fd;
+	char s_sni[256];
+	X509     *s_cert = NULL;
+	EVP_PKEY *s_pkey = NULL;
+	SSL_CTX  *s_ssl_ctx;
+	time_t s_expiry;
+	int s_source; /* 0=local, 1=global, 2=generated */
+
+	if (ssl_cert_cache_normalize_sni(s_sni, sizeof(s_sni), s_sni_raw) != 0) {
+		/* Fallback: use raw SNI (truncated safely) */
+		(void)strncpy(s_sni, s_sni_raw, sizeof(s_sni) - 1u);
+		s_sni[sizeof(s_sni) - 1u] = '\0';
+	}
+
+	/* Tier-1: per-worker local cache (lock-free) */
+	if ((s_worker_context != NULL) &&
+	    ssl_cert_cache_local_lookup(&s_worker_context->m_cert_cache_local,
+	                                s_sni, &s_cert, &s_pkey)) {
+		s_source = 0;
+		goto l_have_cert;
+	}
+
+	/* Tier-2: global cache (rdlock) */
+	if ((s_main_context->m_cert_cache != NULL) &&
+	    ssl_cert_cache_global_lookup(s_main_context->m_cert_cache,
+	                                 s_sni, &s_cert, &s_pkey)) {
+		s_source = 1;
+		/* Promote to local cache (local_store takes its own up_ref) */
+		s_expiry = time(NULL) + (time_t)def_ssl_cert_cache_ttl_secs;
+		if (s_worker_context != NULL)
+			ssl_cert_cache_local_store(&s_worker_context->m_cert_cache_local,
+			                           s_sni, s_cert, s_pkey, s_expiry);
+		goto l_have_cert;
+	}
+
+	/* Miss: generate a CA-signed leaf cert */
+	if (SSL_inspection_unlikely(s_main_context->m_ca_pkey == NULL ||
+	                             s_main_context->m_ca_x509 == NULL)) {
+		(void)SSL_inspection_fprintf(stderr,
+			"sni ctx: CA not initialized, cannot generate cert for \"%s\"\n", s_sni);
+		return NULL;
+	}
+	if (SSL_inspection_unlikely(ssl_inspection_generate_leaf_cert(
+	        s_main_context, s_sni, &s_cert, &s_pkey) != 0)) {
+		return NULL;
+	}
+	s_source = 2;
+	s_expiry  = time(NULL) + (time_t)def_ssl_cert_cache_ttl_secs;
+
+	/* Global store with thundering-herd guard.
+	 * out_cert/out_pkey receive the canonical cert (ours or winner's, up_ref'd).
+	 * We then free our generated copies. */
+	if (s_main_context->m_cert_cache != NULL) {
+		X509     *s_out_cert = NULL;
+		EVP_PKEY *s_out_pkey = NULL;
+		(void)ssl_cert_cache_global_store(s_main_context->m_cert_cache,
+		                                  s_sni, s_cert, s_pkey, s_expiry,
+		                                  &s_out_cert, &s_out_pkey);
+		/* Release our generated copies (global store holds its own ref) */
+		X509_free(s_cert);
+		EVP_PKEY_free(s_pkey);
+		s_cert = s_out_cert;
+		s_pkey = s_out_pkey;
+	}
+
+	/* Local store (takes its own up_ref internally) */
+	if (s_worker_context != NULL)
+		ssl_cert_cache_local_store(&s_worker_context->m_cert_cache_local,
+		                           s_sni, s_cert, s_pkey, s_expiry);
+
+l_have_cert:
+	if (s_main_context->m_is_verbose >= 2) {
+		static const char * const s_src_name[] = {"local-cache", "global-cache", "generated"};
+		(void)SSL_inspection_fprintf(stdout,
+			"sni ctx: \"%s\" [%s]\n", s_sni,
+			s_src_name[(s_source < 3) ? s_source : 2]);
+	}
+
+	s_ssl_ctx = ssl_inspection_create_accept_ssl_ctx(s_main_context, s_cert, s_pkey);
+
+	/* Release caller refs: SSL_CTX_use_certificate/PrivateKey already up_ref'd */
+	X509_free(s_cert);
+	EVP_PKEY_free(s_pkey);
+
+	return s_ssl_ctx;
+}
+
 SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_context, int s_is_server_side, const char *s_hostname)
 {
 	SSL_CTX *s_ssl_ctx;
@@ -770,7 +1711,7 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 	}
 	if((s_main_context->m_certificate_pathname != ((const char *)(NULL))) && (s_main_context->m_privatekey_pathname != ((const char *)(NULL)))) { /* set */
 		if(s_main_context->m_is_verbose >= 1) {
-			(void)SSL_inspection_fprintf(stdout, "Using RSA certificate file ... (\"%s\")\n", s_main_context->m_certificate_pathname);
+			(void)SSL_inspection_fprintf(stdout, "Using certificate file ... (\"%s\")\n", s_main_context->m_certificate_pathname);
 		}
 
 		s_check = SSL_CTX_use_certificate_file(s_ssl_ctx, s_main_context->m_certificate_pathname, SSL_FILETYPE_PEM);
@@ -782,7 +1723,7 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 		}
 
 		if(s_main_context->m_is_verbose >= 1) {
-			(void)SSL_inspection_fprintf(stdout, "Using RSA private key file ... (\"%s\")\n", s_main_context->m_privatekey_pathname);
+			(void)SSL_inspection_fprintf(stdout, "Using private key file ... (\"%s\")\n", s_main_context->m_privatekey_pathname);
 		}
 
 		s_check = SSL_CTX_use_PrivateKey_file (s_ssl_ctx, s_main_context->m_privatekey_pathname, SSL_FILETYPE_PEM);
@@ -802,16 +1743,66 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 		}
 	}
 	else { /* generate or read x509 */
-		const int c_rsa_keysize_bits = 2048;
 		EVP_PKEY *s_evp_pkey;
 		X509 *s_x509;
 #if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 #else
-		RSA *s_rsa;
+		EC_KEY *s_ec_key;
 #endif
 
+		/* Startup (hostname=NULL) with a pre-built CA: generate a default leaf cert
+		 * (CN=localhost, SAN DNS:localhost) so the SSL_CTX presents a valid server cert.
+		 * Per-SNI calls never reach here; they use ssl_inspection_get_or_create_sni_ssl_ctx(). */
+		if ((s_is_server_side > 0) &&
+		    (s_hostname == ((const char *)(NULL))) &&
+		    (s_main_context->m_ca_pkey != ((EVP_PKEY *)(NULL))) &&
+		    (s_main_context->m_ca_x509 != ((X509 *)(NULL)))) {
+			X509     *s_leaf_cert = NULL;
+			EVP_PKEY *s_leaf_pkey = NULL;
+			int s_rc;
+			if (SSL_inspection_unlikely(ssl_inspection_generate_leaf_cert(
+			        s_main_context, "localhost", &s_leaf_cert, &s_leaf_pkey) != 0)) {
+				SSL_CTX_free(s_ssl_ctx);
+				return((SSL_CTX *)(NULL));
+			}
+			s_rc = SSL_CTX_use_certificate(s_ssl_ctx, s_leaf_cert);
+			if (SSL_inspection_unlikely(s_rc <= 0)) {
+				ERR_print_errors_fp(stderr);
+				(void)SSL_inspection_fprintf(stderr, "SSL_CTX_use_certificate (default leaf) failed\n");
+				X509_free(s_leaf_cert);
+				EVP_PKEY_free(s_leaf_pkey);
+				SSL_CTX_free(s_ssl_ctx);
+				return((SSL_CTX *)(NULL));
+			}
+			s_rc = SSL_CTX_use_PrivateKey(s_ssl_ctx, s_leaf_pkey);
+			if (SSL_inspection_unlikely(s_rc <= 0)) {
+				ERR_print_errors_fp(stderr);
+				(void)SSL_inspection_fprintf(stderr, "SSL_CTX_use_PrivateKey (default leaf) failed\n");
+				X509_free(s_leaf_cert);
+				EVP_PKEY_free(s_leaf_pkey);
+				SSL_CTX_free(s_ssl_ctx);
+				return((SSL_CTX *)(NULL));
+			}
+			s_rc = SSL_CTX_check_private_key(s_ssl_ctx);
+			if (SSL_inspection_unlikely(s_rc <= 0)) {
+				ERR_print_errors_fp(stderr);
+				(void)SSL_inspection_fprintf(stderr, "SSL_CTX_check_private_key (default leaf) failed\n");
+				X509_free(s_leaf_cert);
+				EVP_PKEY_free(s_leaf_pkey);
+				SSL_CTX_free(s_ssl_ctx);
+				return((SSL_CTX *)(NULL));
+			}
+			/* Add CA cert to chain so clients see the full chain */
+			X509_up_ref(s_main_context->m_ca_x509);
+			if (SSL_inspection_unlikely(SSL_CTX_add_extra_chain_cert(s_ssl_ctx, s_main_context->m_ca_x509) <= 0)) {
+				X509_free(s_main_context->m_ca_x509);
+			}
+			X509_free(s_leaf_cert);
+			EVP_PKEY_free(s_leaf_pkey);
+			goto l_ssl_ctx_cert_done;
+		}
+
 #if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
-		/* M-1: honour --key option on OpenSSL >=3.0; EVP_RSA_gen was always called before */
 		if(s_main_context->m_privatekey_pathname != ((const char *)(NULL))) {
 			BIO *s_bio_key = BIO_new_file(s_main_context->m_privatekey_pathname, "rb");
 			if(SSL_inspection_unlikely(s_bio_key == ((BIO *)(NULL)))) {
@@ -824,9 +1815,9 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 		}
 		else {
 			if(s_main_context->m_is_verbose >= 1) {
-				(void)SSL_inspection_fprintf(stdout, "Generating RSA private key ...\n");
+				(void)SSL_inspection_fprintf(stdout, "Generating ECDSA P-256 private key ...\n");
 			}
-			s_evp_pkey = EVP_RSA_gen(c_rsa_keysize_bits);
+			s_evp_pkey = EVP_EC_gen(SN_X9_62_prime256v1);
 		}
 #else
 		s_evp_pkey = EVP_PKEY_new();
@@ -849,70 +1840,41 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 #else
 		if(s_main_context->m_privatekey_pathname == ((const char *)(NULL))) { /* generate */
 			if(s_main_context->m_is_verbose >= 1) {
-				(void)SSL_inspection_fprintf(stdout, "Generating RSA private key ...\n");
+				(void)SSL_inspection_fprintf(stdout, "Generating ECDSA P-256 private key ...\n");
 			}
 
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L) && !defined(LIBRESSL_VERSION_NUMBER)
-			do {
-				BIGNUM *s_bignum;
-				
-				s_rsa = RSA_new();
-				if(SSL_inspection_unlikely(s_rsa == ((RSA *)(NULL)))) {
-					(void)SSL_inspection_fprintf(stderr, "RSA_new failed !\n");
-					X509_free(s_x509);
-					EVP_PKEY_free(s_evp_pkey);
-					SSL_CTX_free(s_ssl_ctx);
-					return((SSL_CTX *)(NULL));
-				}
-				
-				s_bignum = BN_new();
-				if(SSL_inspection_unlikely(s_bignum == ((BIGNUM *)(NULL)))) {
-					(void)SSL_inspection_fprintf(stderr, "BN_new failed !\n");
-					RSA_free(s_rsa);
-					X509_free(s_x509);
-					EVP_PKEY_free(s_evp_pkey);
-					SSL_CTX_free(s_ssl_ctx);
-					return((SSL_CTX *)(NULL));
-				}
-				/* N-1: check BN_dec2bn — returns 0 on failure, leaving s_bignum invalid */
-				if(SSL_inspection_unlikely(BN_dec2bn(&s_bignum, "65537") == 0)) {
-					(void)SSL_inspection_fprintf(stderr, "BN_dec2bn failed !\n");
-					BN_free(s_bignum);
-					RSA_free(s_rsa);
-					X509_free(s_x509);
-					EVP_PKEY_free(s_evp_pkey);
-					SSL_CTX_free(s_ssl_ctx);
-					return((SSL_CTX *)(NULL));
-				}
-
-				s_check = RSA_generate_key_ex(s_rsa, c_rsa_keysize_bits, s_bignum, NULL);
-				BN_free(s_bignum);
-				if(SSL_inspection_unlikely(s_check != 1)) {
-					(void)SSL_inspection_fprintf(stderr, "RSA_generate_key_ex failed !\n");
-					RSA_free(s_rsa);
-					X509_free(s_x509);
-					EVP_PKEY_free(s_evp_pkey);
-					SSL_CTX_free(s_ssl_ctx);
-					return((SSL_CTX *)(NULL));
-				}
-			}while(0);
-#else
-			/* RSA *RSA_generate_key(int bits, unsigned long e,void (*callback)(int,int,void *),void *cb_arg); */
-			s_rsa = RSA_generate_key(c_rsa_keysize_bits, RSA_F4, (void (*)(int,int,void *))0 /* callback */, (void *)(NULL));
-			if(SSL_inspection_unlikely(s_rsa == ((RSA *)(NULL)))) {
-				(void)SSL_inspection_fprintf(stderr, "RSA_generate_key failed !\n");
+			s_ec_key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+			if(SSL_inspection_unlikely(s_ec_key == ((EC_KEY *)(NULL)))) {
+				(void)SSL_inspection_fprintf(stderr, "EC_KEY_new_by_curve_name failed !\n");
 				X509_free(s_x509);
 				EVP_PKEY_free(s_evp_pkey);
 				SSL_CTX_free(s_ssl_ctx);
 				return((SSL_CTX *)(NULL));
 			}
-#endif
+			EC_KEY_set_asn1_flag(s_ec_key, OPENSSL_EC_NAMED_CURVE);
+			if(SSL_inspection_unlikely(EC_KEY_generate_key(s_ec_key) != 1)) {
+				(void)SSL_inspection_fprintf(stderr, "EC_KEY_generate_key failed !\n");
+				EC_KEY_free(s_ec_key);
+				X509_free(s_x509);
+				EVP_PKEY_free(s_evp_pkey);
+				SSL_CTX_free(s_ssl_ctx);
+				return((SSL_CTX *)(NULL));
+			}
+			if(SSL_inspection_unlikely(EVP_PKEY_assign_EC_KEY(s_evp_pkey, s_ec_key) == 0)) {
+				(void)SSL_inspection_fprintf(stderr, "EVP_PKEY_assign_EC_KEY failed !\n");
+				EC_KEY_free(s_ec_key);
+				X509_free(s_x509);
+				EVP_PKEY_free(s_evp_pkey);
+				SSL_CTX_free(s_ssl_ctx);
+				return((SSL_CTX *)(NULL));
+			}
+			s_ec_key = (EC_KEY *)(NULL); /* assigned to evp_pkey */
 		}
 		else { /* read */
 			FILE *s_fp;
-			
+
 			if(s_main_context->m_is_verbose >= 1) {
-				(void)SSL_inspection_fprintf(stdout, "Loading RSA private key file ...\n");
+				(void)SSL_inspection_fprintf(stdout, "Loading private key file ...\n");
 			}
 
 			s_fp = fopen(s_main_context->m_privatekey_pathname, "rb");
@@ -924,29 +1886,17 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 				return((SSL_CTX *)(NULL));
 			}
 
-			s_rsa = PEM_read_RSAPrivateKey(s_fp, NULL, NULL, NULL);
-			if(SSL_inspection_unlikely(s_rsa == ((RSA *)(NULL)))) {
-				(void)SSL_inspection_fprintf(stderr, "PEM_read_RSAPrivateKey failed !\n");
-				(void)fclose(s_fp); /* N-2: result discarded — already on error path */
+			/* Discard EVP_PKEY_new() placeholder; load key type-agnostically from file */
+			EVP_PKEY_free(s_evp_pkey);
+			s_evp_pkey = PEM_read_PrivateKey(s_fp, (EVP_PKEY **)(NULL), (pem_password_cb *)(NULL), (void *)(NULL));
+			(void)fclose(s_fp);
+			if(SSL_inspection_unlikely(s_evp_pkey == ((EVP_PKEY *)(NULL)))) {
+				(void)SSL_inspection_fprintf(stderr, "PEM_read_PrivateKey failed !\n");
 				X509_free(s_x509);
-				EVP_PKEY_free(s_evp_pkey);
 				SSL_CTX_free(s_ssl_ctx);
 				return((SSL_CTX *)(NULL));
 			}
-
-			(void)fclose(s_fp); /* N-2: result discarded — next is EVP_PKEY_assign_RSA */
 		}
-
-		s_check = EVP_PKEY_assign_RSA(s_evp_pkey, s_rsa);
-		if(SSL_inspection_unlikely(s_check == 0)) {
-			(void)SSL_inspection_fprintf(stderr, "EVP_PKEY_assign_RSA failed !\n");
-			RSA_free(s_rsa);
-			X509_free(s_x509);
-			EVP_PKEY_free(s_evp_pkey);
-			SSL_CTX_free(s_ssl_ctx);
-			return((SSL_CTX *)(NULL));
-		}
-		s_rsa = (RSA *)(NULL); /* s_rsa to EVP assigned */
 #endif
 
 		/* N-1: X509_set_version returns int in OpenSSL 1.1+ */
@@ -1117,7 +2067,7 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 
 		s_check = X509_sign(s_x509, s_evp_pkey, EVP_sha256() /* or EVP_sha1 or EVP_md5 */);
 		if(SSL_inspection_unlikely(s_check == 0)) {
-			(void)SSL_inspection_fprintf(stderr, "X509_sign failed !\n");
+			(void)SSL_inspection_fprintf(stderr, "X509_sign failed (hostname=\"%s\")\n", s_hostname ? s_hostname : "");
 			X509_free(s_x509);
 			EVP_PKEY_free(s_evp_pkey);
 			SSL_CTX_free(s_ssl_ctx);
@@ -1127,7 +2077,7 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 		s_check = SSL_CTX_use_certificate(s_ssl_ctx, s_x509);
 		if(SSL_inspection_unlikely(s_check <= 0)) {
 			ERR_print_errors_fp(stderr);
-			(void)SSL_inspection_fprintf(stderr, "SSL_CTX_use_certificate failed !\n");
+			(void)SSL_inspection_fprintf(stderr, "SSL_CTX_use_certificate failed (hostname=\"%s\")\n", s_hostname ? s_hostname : "");
 			X509_free(s_x509);
 			EVP_PKEY_free(s_evp_pkey);
 			SSL_CTX_free(s_ssl_ctx);
@@ -1137,7 +2087,7 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 		s_check = SSL_CTX_use_PrivateKey(s_ssl_ctx, s_evp_pkey);
 		if(SSL_inspection_unlikely(s_check <= 0)) {
 			ERR_print_errors_fp(stderr);
-			(void)SSL_inspection_fprintf(stderr, "SSL_CTX_use_PrivateKey failed !\n");
+			(void)SSL_inspection_fprintf(stderr, "SSL_CTX_use_PrivateKey failed (hostname=\"%s\")\n", s_hostname ? s_hostname : "");
 			X509_free(s_x509);
 			EVP_PKEY_free(s_evp_pkey);
 			SSL_CTX_free(s_ssl_ctx);
@@ -1147,7 +2097,7 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 		s_check = SSL_CTX_check_private_key(s_ssl_ctx);
 		if(SSL_inspection_unlikely(s_check <= 0)) {
 			ERR_print_errors_fp(stderr);
-			(void)SSL_inspection_fprintf(stderr, "SSL_CTX_check_private_key failed !\n");
+			(void)SSL_inspection_fprintf(stderr, "SSL_CTX_check_private_key failed (hostname=\"%s\")\n", s_hostname ? s_hostname : "");
 			X509_free(s_x509);
 			EVP_PKEY_free(s_evp_pkey);
 			SSL_CTX_free(s_ssl_ctx);
@@ -1156,6 +2106,8 @@ SSL_CTX *SSL_inspection_new_SSL_CTX(SSL_inspection_main_context_t *s_main_contex
 
 		X509_free(s_x509);
 		EVP_PKEY_free(s_evp_pkey);
+
+l_ssl_ctx_cert_done:; /* reached by CA-fallback path via goto */
 	}
 
 	/* Server-side TLS session cache: clients resume sessions without a full handshake */
@@ -1219,7 +2171,10 @@ int SSL_inspection_worker_set_epoll_interest(SSL_inspection_worker_context_t *s_
 				 * The fd will be closed by the caller, which removes it from epoll on Linux.
 				 * Not clearing m_is_registered here would leave a stale pointer in epoll_item
 				 * that could be dereferenced after the session is freed. */
-				(void)SSL_inspection_fprintf(stderr, "epoll_ctl DEL unexpected error (fd=%d): %s\n", s_fd, strerror(errno));
+				(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sepoll_ctl DEL unexpected error%s (fd=%d): %s\n",
+					sg_ce_c, (s_epoll_item->m_session != ((SSL_inspection_session_t *)(NULL))) ? s_epoll_item->m_session->m_accept_socket : (-1), sg_ce_n,
+					sg_ce_r, sg_ce_n,
+					s_fd, strerror(errno));
 			}
 		}
 
@@ -1347,7 +2302,7 @@ void SSL_inspection_worker_release_session_resources(SSL_inspection_worker_conte
 	}
 }
 
-void SSL_inspection_trace_transfer(SSL_inspection_main_context_t *s_main_context, const char *s_title, int s_fd, unsigned long long s_transferred, const void *s_buffer, size_t s_size)
+void SSL_inspection_trace_transfer(SSL_inspection_main_context_t *s_main_context, int s_accept_fd, const char *s_title, int s_fd, unsigned long long s_transferred, const void *s_buffer, size_t s_size)
 {
 	char *s_ascii;
 
@@ -1355,32 +2310,34 @@ void SSL_inspection_trace_transfer(SSL_inspection_main_context_t *s_main_context
 		return;
 	}
 
-	if(s_main_context->m_is_verbose >= 4) {
-		(void)SSL_inspection_fprintf(stdout, "%s (fd=%d) %llu + %lu bytes\n", s_title, s_fd, s_transferred, (unsigned long)s_size);
-		(void)SSL_inspection_hexdump("  ", s_buffer, s_size);
-		return;
-	}
+	{
+		const char *s_fd_label = (s_fd == s_accept_fd) ? "C-fd" : "S-fd";
+		const char *s_fd_color = (s_fd == s_accept_fd) ? sg_co_c : sg_co_y;
 
-	if(s_main_context->m_is_verbose >= 3) {
-		s_ascii = (char *)malloc(s_size + ((size_t)1u));
-		if(s_ascii != ((char *)(NULL))) {
-			(void)SSL_inspection_convert_printable_ascii((void *)s_ascii, s_buffer, s_size);
-			s_ascii[s_size] = '\0';
-			(void)SSL_inspection_fprintf(stdout, "%s (fd=%d) {\n%.*s} %llu + %lu bytes\n", s_title, s_fd, (int)s_size, s_ascii, s_transferred, (unsigned long)s_size);
-			free((void *)s_ascii);
+		if(s_main_context->m_is_verbose >= 4) {
+			(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s %s (%s%s=%d%s) %llu + %lu bytes\n", sg_co_c, s_accept_fd, sg_co_n, s_title, s_fd_color, s_fd_label, s_fd, sg_co_n, s_transferred, (unsigned long)s_size);
+			(void)SSL_inspection_hexdump("  ", s_buffer, s_size);
+			return;
+		}
+
+		if(s_main_context->m_is_verbose >= 3) {
+			s_ascii = (char *)malloc(s_size + ((size_t)1u));
+			if(s_ascii != ((char *)(NULL))) {
+				(void)SSL_inspection_convert_printable_ascii((void *)s_ascii, s_buffer, s_size);
+				s_ascii[s_size] = '\0';
+				(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s %s (%s%s=%d%s) {\n%.*s} %llu + %lu bytes\n", sg_co_c, s_accept_fd, sg_co_n, s_title, s_fd_color, s_fd_label, s_fd, sg_co_n, (int)s_size, s_ascii, s_transferred, (unsigned long)s_size);
+				free((void *)s_ascii);
+				return;
+			}
+		}
+
+		if(s_main_context->m_is_verbose >= 2) {
+			(void)SSL_inspection_fprintf(stdout, "%s[C-fd=%d]%s %s (%s%s=%d%s) %llu + %lu bytes\n", sg_co_c, s_accept_fd, sg_co_n, s_title, s_fd_color, s_fd_label, s_fd, sg_co_n, s_transferred, (unsigned long)s_size);
+			(void)SSL_inspection_hexdump("  ", s_buffer, (s_size >= ((size_t)16u)) ? ((size_t)16u) : s_size);
 			return;
 		}
 	}
 
-	if(s_main_context->m_is_verbose >= 2) {
-		(void)SSL_inspection_fprintf(stdout, "%s (fd=%d) %llu + %lu bytes\n", s_title, s_fd, s_transferred, (unsigned long)s_size);
-		(void)SSL_inspection_hexdump("  ", s_buffer, (s_size >= ((size_t)16u)) ? ((size_t)16u) : s_size);
-		return;
-	}
-
-	if(s_main_context->m_is_verbose >= 1) {
-		(void)SSL_inspection_fprintf(stdout, "%s (fd=%d) %llu + %lu bytes\n", s_title, s_fd, s_transferred, (unsigned long)s_size);
-	}
 }
 
 void SSL_inspection_session_clear_async_wait(SSL_inspection_session_t *s_session, SSL_inspection_async_wait_t *s_async_wait)
@@ -1540,8 +2497,8 @@ int SSL_inspection_session_ensure_ssl(SSL_inspection_session_t *s_session, int s
 		SSL_set_connect_state(s_ssl);
 		if(s_session->m_sni_hostname[0] != '\0') {
 			if(SSL_inspection_unlikely(SSL_set_tlsext_host_name(s_ssl, s_session->m_sni_hostname) != 1)) {
-				(void)SSL_inspection_fprintf(stderr, "SSL_set_tlsext_host_name failed ! (sni=\"%s\")\n",
-					s_session->m_sni_hostname);
+				(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sSSL_set_tlsext_host_name failed%s (sni=\"%s%s%s\")\n",
+					sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n, sg_ce_y, s_session->m_sni_hostname, sg_ce_n);
 			}
 		}
 	}
@@ -1615,47 +2572,67 @@ int SSL_inspection_session_drive_connect(SSL_inspection_session_t *s_session)
 	s_session->m_state = (s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? def_SSL_inspection_session_state_stream : def_SSL_inspection_session_state_connect_ssl_handshake;
 
 	if(s_main_context->m_is_verbose >= 1) {
-		if(s_main_context->m_use_tproxy != 0) {
-			char s_conn_dst_str[INET6_ADDRSTRLEN] = {0};
-			int s_conn_dst_port = 0;
-			if(s_session->m_sockaddr_original_dst.ss_family == AF_INET) {
-				(void)inet_ntop(AF_INET, &((struct sockaddr_in *)(&s_session->m_sockaddr_original_dst))->sin_addr,
-					s_conn_dst_str, (socklen_t)sizeof(s_conn_dst_str));
-				s_conn_dst_port = (int)ntohs(((struct sockaddr_in *)(&s_session->m_sockaddr_original_dst))->sin_port);
-			}
-			else if(s_session->m_sockaddr_original_dst.ss_family == AF_INET6) {
-				(void)inet_ntop(AF_INET6, &((struct sockaddr_in6 *)(&s_session->m_sockaddr_original_dst))->sin6_addr,
-					s_conn_dst_str, (socklen_t)sizeof(s_conn_dst_str));
-				s_conn_dst_port = (int)ntohs(((struct sockaddr_in6 *)(&s_session->m_sockaddr_original_dst))->sin6_port);
-			}
-			(void)SSL_inspection_fprintf(
-				stdout,
-				"%s connected[tproxy]. (fd=%d, socket_flags=0x%x%s, for fd=%d, \"[%s]:%d\")\n",
-				(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? "TCP" : "SSL",
-				s_session->m_connect_socket,
-				s_session->m_connect_socket_flags,
-				((s_session->m_connect_socket_flags != (-1)) && ((s_session->m_connect_socket_flags & O_NONBLOCK) == O_NONBLOCK)) ? "[NONBLOCK]" : "[BLOCK]",
-				s_session->m_accept_socket,
-				s_conn_dst_str,
-				s_conn_dst_port
-			);
-		}
-		else {
-			(void)SSL_inspection_fprintf(
-				stdout,
-				"%s connected. (fd=%d, socket_flags=0x%x%s, for fd=%d, \"[%s]:%d\")\n",
-				(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? "TCP" : "SSL",
-				s_session->m_connect_socket,
-				s_session->m_connect_socket_flags,
-				((s_session->m_connect_socket_flags != (-1)) && ((s_session->m_connect_socket_flags & O_NONBLOCK) == O_NONBLOCK)) ? "[NONBLOCK]" : "[BLOCK]",
-				s_session->m_accept_socket,
-				s_main_context->m_connect_address,
-				s_main_context->m_connect_port
-			);
-		}
+		char s_tuple[128];
+		SSL_inspection_session_format_tuple(s_session, s_tuple, sizeof(s_tuple));
+		(void)SSL_inspection_fprintf(stdout,
+			"%s[C-fd=%d]%s %s %sconnected%s%s %s (%sS-fd=%d%s)\n",
+			sg_co_c, s_session->m_accept_socket, sg_co_n,
+			(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? "TCP" : "SSL",
+			sg_co_g, sg_co_n,
+			(s_main_context->m_use_tproxy != 0) ? "[tproxy]" : "",
+			s_tuple,
+			sg_co_y, s_session->m_connect_socket, sg_co_n
+		);
 	}
 
 	return(1);
+}
+
+static void SSL_inspection_pkey_algo_str(EVP_PKEY *s_pkey, char *s_buf, size_t s_buf_size)
+{
+	int s_type;
+	int s_bits;
+
+	if(s_pkey == ((EVP_PKEY *)(NULL))) {
+		(void)snprintf(s_buf, s_buf_size, "(none)");
+		return;
+	}
+
+	s_type = EVP_PKEY_base_id(s_pkey);
+	s_bits = EVP_PKEY_bits(s_pkey);
+
+	if(s_type == EVP_PKEY_EC) {
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+		char s_curve[64];
+		size_t s_curve_len = 0u;
+		if(EVP_PKEY_get_group_name(s_pkey, s_curve, sizeof(s_curve), &s_curve_len) == 1) {
+			(void)snprintf(s_buf, s_buf_size, "ECDSA/%s", s_curve);
+		}
+		else {
+			(void)snprintf(s_buf, s_buf_size, "ECDSA/%dbits", s_bits);
+		}
+#else
+		const char *s_curve = "(unknown)";
+		EC_KEY *s_ec_key = EVP_PKEY_get0_EC_KEY(s_pkey);
+		if(s_ec_key != ((EC_KEY *)(NULL))) {
+			const EC_GROUP *s_group = EC_KEY_get0_group(s_ec_key);
+			if(s_group != ((const EC_GROUP *)(NULL))) {
+				const char *s_sn = OBJ_nid2sn(EC_GROUP_get_curve_name(s_group));
+				if(s_sn != ((const char *)(NULL))) {
+					s_curve = s_sn;
+				}
+			}
+		}
+		(void)snprintf(s_buf, s_buf_size, "ECDSA/%s", s_curve);
+#endif
+	}
+	else if(s_type == EVP_PKEY_RSA) {
+		(void)snprintf(s_buf, s_buf_size, "RSA/%d", s_bits);
+	}
+	else {
+		const char *s_name = OBJ_nid2sn(s_type);
+		(void)snprintf(s_buf, s_buf_size, "%s/%d", (s_name != ((const char *)(NULL))) ? s_name : "?", s_bits);
+	}
 }
 
 int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, int s_is_accept_side)
@@ -1707,13 +2684,13 @@ int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, 
 
 	if(s_main_context->m_use_serialize_lock != 0) {
 		if(SSL_inspection_unlikely(pthread_mutex_lock((pthread_mutex_t *)(&s_main_context->m_serialize_lock)) != 0)) {
-			(void)SSL_inspection_fprintf(stderr, "serialize: pthread_mutex_lock (%s)\n", (s_is_accept_side != 0) ? "accept" : "connect");
+			(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s serialize: pthread_mutex_lock (%s)\n", sg_ce_c, s_session->m_accept_socket, sg_ce_n, (s_is_accept_side != 0) ? "accept" : "connect");
 		}
 	}
 	s_check = SSL_do_handshake(s_ssl);
 	if(s_main_context->m_use_serialize_lock != 0) {
 		if(SSL_inspection_unlikely(pthread_mutex_unlock((pthread_mutex_t *)(&s_main_context->m_serialize_lock)) != 0)) {
-			(void)SSL_inspection_fprintf(stderr, "serialize: pthread_mutex_unlock (%s)\n", (s_is_accept_side != 0) ? "accept" : "connect");
+			(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s serialize: pthread_mutex_unlock (%s)\n", sg_ce_c, s_session->m_accept_socket, sg_ce_n, (s_is_accept_side != 0) ? "accept" : "connect");
 		}
 	}
 	if(s_check == 1) {
@@ -1725,63 +2702,67 @@ int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, 
 			const char *s_cipher_name = (s_cipher != ((const SSL_CIPHER *)(NULL))) ? SSL_CIPHER_get_name(s_cipher) : "(none)";
 			int s_cipher_bits = (s_cipher != ((const SSL_CIPHER *)(NULL))) ? SSL_CIPHER_get_bits(s_cipher, (int *)(NULL)) : 0;
 
-			/* Detect which ENGINE/PROVIDER handles asymmetric key ops for this session.
-			 * SSL_get_privatekey() is non-NULL when we own the private key (server side,
-			 * or client-side mutual TLS). On connect side without a client cert it will be
-			 * NULL and we fall back to the global engine or "built-in". */
-			const char *s_asym_impl = NULL;
+			/* accept side: our private key type; connect side: peer cert public key type */
+			char s_asym_algo[128];
 			{
-				EVP_PKEY *s_pkey = SSL_get_privatekey(s_ssl);
-				if(s_pkey != ((EVP_PKEY *)(NULL))) {
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
-					{
-						const OSSL_PROVIDER *s_prov = EVP_PKEY_get0_provider(s_pkey);
-						if(s_prov != ((const OSSL_PROVIDER *)(NULL))) {
-							s_asym_impl = OSSL_PROVIDER_get0_name(s_prov);
-						}
-					}
-#elif !defined(OPENSSL_NO_ENGINE)
-					ENGINE *s_pkey_engine = EVP_PKEY_get0_engine(s_pkey);
-					if(s_pkey_engine != ((ENGINE *)(NULL))) {
-						s_asym_impl = ENGINE_get_name(s_pkey_engine);
-					}
-#endif
+				EVP_PKEY *s_pkey;
+				EVP_PKEY *s_pkey_to_free = (EVP_PKEY *)(NULL);
+
+				if(s_is_accept_side != 0) {
+					s_pkey = SSL_get_privatekey(s_ssl); /* borrowed */
 				}
-#if (OPENSSL_VERSION_NUMBER < 0x30000000L) && !defined(OPENSSL_NO_ENGINE)
-				if((s_asym_impl == ((const char *)(NULL))) && (s_main_context->m_engine != ((ENGINE *)(NULL)))) {
-					s_asym_impl = ENGINE_get_name(s_main_context->m_engine);
-				}
+				else {
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+					X509 *s_peer_cert = SSL_get1_peer_certificate(s_ssl);
+#else
+					X509 *s_peer_cert = SSL_get_peer_certificate(s_ssl);
 #endif
-				if(s_asym_impl == ((const char *)(NULL))) {
-					s_asym_impl = "built-in";
+					if(s_peer_cert != ((X509 *)(NULL))) {
+						s_pkey = s_pkey_to_free = X509_get_pubkey(s_peer_cert);
+						X509_free(s_peer_cert);
+					}
+					else {
+						s_pkey = (EVP_PKEY *)(NULL);
+					}
+				}
+
+				SSL_inspection_pkey_algo_str(s_pkey, s_asym_algo, sizeof(s_asym_algo));
+
+				if(s_pkey_to_free != ((EVP_PKEY *)(NULL))) {
+					EVP_PKEY_free(s_pkey_to_free);
 				}
 			}
 
-			if(s_is_accept_side != 0) {
-				(void)SSL_inspection_fprintf(stdout,
-					"SSL Accepted (fd=%d, socket_flags=0x%x%s, sni=\"%s\", %s, %s, %dbits, asym=%s)\n",
-					s_session->m_accept_socket,
-					s_session->m_accept_socket_flags,
-					((s_session->m_accept_socket_flags != (-1)) && ((s_session->m_accept_socket_flags & O_NONBLOCK) == O_NONBLOCK)) ? "[NONBLOCK]" : "[BLOCK]",
-					(s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "(none)",
-					s_tls_version,
-					s_cipher_name,
-					s_cipher_bits,
-					s_asym_impl
-				);
-			}
-			else {
-				(void)SSL_inspection_fprintf(stdout,
-					"SSL Connected (fd=%d, socket_flags=0x%x%s, sni=\"%s\", %s, %s, %dbits, asym=%s)\n",
-					s_session->m_connect_socket,
-					s_session->m_connect_socket_flags,
-					((s_session->m_connect_socket_flags != (-1)) && ((s_session->m_connect_socket_flags & O_NONBLOCK) == O_NONBLOCK)) ? "[NONBLOCK]" : "[BLOCK]",
-					(s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "(none)",
-					s_tls_version,
-					s_cipher_name,
-					s_cipher_bits,
-					s_asym_impl
-				);
+			{
+				char s_tuple[128];
+				SSL_inspection_session_format_tuple(s_session, s_tuple, sizeof(s_tuple));
+				if(s_is_accept_side != 0) {
+					(void)SSL_inspection_fprintf(stdout,
+						"%s[C-fd=%d]%s %sSSL Accepted%s %s sni=\"%s%s%s\", %s, %s, %dbits, asym=%s\n",
+						sg_co_c, s_session->m_accept_socket, sg_co_n,
+						sg_co_m, sg_co_n,
+						s_tuple,
+						sg_co_y, (s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "(none)", sg_co_n,
+						s_tls_version,
+						s_cipher_name,
+						s_cipher_bits,
+						s_asym_algo
+					);
+				}
+				else {
+					(void)SSL_inspection_fprintf(stdout,
+						"%s[C-fd=%d]%s %sSSL Connected%s %s sni=\"%s%s%s\", %s, %s, %dbits, asym=%s (%sS-fd=%d%s)\n",
+						sg_co_c, s_session->m_accept_socket, sg_co_n,
+						sg_co_m, sg_co_n,
+						s_tuple,
+						sg_co_y, (s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "(none)", sg_co_n,
+						s_tls_version,
+						s_cipher_name,
+						s_cipher_bits,
+						s_asym_algo,
+						sg_co_y, s_session->m_connect_socket, sg_co_n
+					);
+				}
 			}
 		}
 		s_session->m_state = (unsigned int)s_state_done;
@@ -1815,7 +2796,7 @@ int SSL_inspection_session_drive_handshake(SSL_inspection_session_t *s_session, 
 	}
 
 	while((s_check = (int)ERR_get_error()) != 0) {
-		(void)SSL_inspection_fprintf(stderr, "SSL_do_handshake failed ! (%s, \"%s\")\n", (s_is_accept_side != 0) ? "accept" : "connect", ERR_error_string((unsigned long)s_check, (char *)(NULL)));
+		(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sSSL_do_handshake failed%s (%s, \"%s\")\n", sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n, (s_is_accept_side != 0) ? "accept" : "connect", ERR_error_string((unsigned long)s_check, (char *)(NULL)));
 	}
 	errno = EIO;
 
@@ -1864,8 +2845,9 @@ ssize_t SSL_inspection_session_recv_nonblock(SSL_inspection_session_t *s_session
 		s_ssl_error = SSL_get_error(s_ssl, 0);
 		if(s_ssl_error != SSL_ERROR_ZERO_RETURN && s_ssl_error != SSL_ERROR_NONE) {
 			(void)SSL_inspection_fprintf(stderr,
-				"SSL_read=0 non-clean close: SSL_get_error=%d (%s, fd=%d)\n",
-				s_ssl_error, (s_is_accept_side != 0) ? "accept" : "connect", s_socket);
+				"%s[C-fd=%d]%s %sSSL_read=0 non-clean close%s: SSL_get_error=%d (%s, fd=%d)\n",
+				sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n, s_ssl_error,
+				(s_is_accept_side != 0) ? "accept" : "connect", s_socket);
 		}
 		return((ssize_t)0);
 	}
@@ -1897,7 +2879,7 @@ ssize_t SSL_inspection_session_recv_nonblock(SSL_inspection_session_t *s_session
 	}
 
 	while((s_check = (int)ERR_get_error()) != 0) {
-		(void)SSL_inspection_fprintf(stderr, "SSL_recv failed ! (%s, \"%s\")\n", (s_is_accept_side != 0) ? "accept" : "connect", ERR_error_string((unsigned long)s_check, (char *)(NULL)));
+		(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sSSL_recv failed%s (%s, \"%s\")\n", sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n, (s_is_accept_side != 0) ? "accept" : "connect", ERR_error_string((unsigned long)s_check, (char *)(NULL)));
 	}
 	errno = EIO;
 
@@ -2022,11 +3004,12 @@ int SSL_inspection_session_flush_buffer(SSL_inspection_session_t *s_session, int
 
 			(void)SSL_inspection_fprintf(
 				stderr,
-				"SSL_inspection_send failed ! (%s) : %s (fd=%d, %s)\n",
+				"%s[C-fd=%d]%s %ssend failed%s (%s, fd=%d, %s): %s\n",
+				sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n,
 				(s_to_accept_side != 0) ? "accept" : "connect",
-				strerror(errno),
 				(s_to_accept_side != 0) ? s_session->m_accept_socket : s_session->m_connect_socket,
-				((s_to_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL"
+				((s_to_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL",
+				strerror(errno)
 			);
 
 			return(-1);
@@ -2034,6 +3017,7 @@ int SSL_inspection_session_flush_buffer(SSL_inspection_session_t *s_session, int
 
 		SSL_inspection_trace_transfer(
 			s_main_context,
+			s_session->m_accept_socket,
 			(s_to_accept_side != 0) ? "To accept tx" : "To connect tx",
 			(s_to_accept_side != 0) ? s_session->m_accept_socket : s_session->m_connect_socket,
 			(s_to_accept_side != 0) ? s_session->m_backward_transfer_size : s_session->m_forward_transfer_size,
@@ -2049,12 +3033,14 @@ int SSL_inspection_session_flush_buffer(SSL_inspection_session_t *s_session, int
 
 		if(s_to_accept_side != 0) {
 			s_session->m_backward_transfer_size += (unsigned long long)s_send_bytes;
+			s_session->m_backward_transfer_count++;
 			if(s_session->m_worker_context != ((SSL_inspection_worker_context_t *)(NULL))) {
 				s_session->m_worker_context->m_backward_transfer_size += (unsigned long long)s_send_bytes;
 			}
 		}
 		else {
 			s_session->m_forward_transfer_size += (unsigned long long)s_send_bytes;
+			s_session->m_forward_transfer_count++;
 			if(s_session->m_worker_context != ((SSL_inspection_worker_context_t *)(NULL))) {
 				s_session->m_worker_context->m_forward_transfer_size += (unsigned long long)s_send_bytes;
 			}
@@ -2106,11 +3092,12 @@ int SSL_inspection_session_fill_buffer(SSL_inspection_session_t *s_session, int 
 
 		(void)SSL_inspection_fprintf(
 			stderr,
-			"SSL_inspection_recv failed ! (%s) : %s (fd=%d, %s)\n",
+			"%s[C-fd=%d]%s %srecv failed%s (%s, fd=%d, %s): %s\n",
+			sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n,
 			(s_from_accept_side != 0) ? "accept" : "connect",
-			strerror(errno),
 			(s_from_accept_side != 0) ? s_session->m_accept_socket : s_session->m_connect_socket,
-			((s_from_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL"
+			((s_from_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL",
+			strerror(errno)
 		);
 
 		return(-1);
@@ -2119,7 +3106,8 @@ int SSL_inspection_session_fill_buffer(SSL_inspection_session_t *s_session, int 
 		if(s_main_context->m_is_verbose >= 1) {
 			(void)SSL_inspection_fprintf(
 				stderr,
-				"SSL_inspection_recv disconnected ! (%s, fd=%d, %s)\n",
+				"%s[C-fd=%d]%s disconnected (%s, fd=%d, %s)\n",
+				sg_ce_c, s_session->m_accept_socket, sg_ce_n,
 				(s_from_accept_side != 0) ? "accept" : "connect",
 				(s_from_accept_side != 0) ? s_session->m_accept_socket : s_session->m_connect_socket,
 				((s_from_accept_side != 0) ? s_session->m_accept_ssl : s_session->m_connect_ssl) == ((SSL *)(NULL)) ? "TCP" : "SSL"
@@ -2130,14 +3118,14 @@ int SSL_inspection_session_fill_buffer(SSL_inspection_session_t *s_session, int 
 		/* N-3: log flush failure so silent data loss is visible in verbose mode */
 		if(SSL_inspection_unlikely(SSL_inspection_session_flush_buffer(s_session, 0) == (-1))) {
 			if(s_main_context->m_is_verbose >= 1) {
-				(void)SSL_inspection_fprintf(stderr, "flush forward buffer failed on FIN (fd=%d)\n",
-					s_session->m_connect_socket);
+				(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sflush forward buffer failed on FIN%s\n",
+					sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n);
 			}
 		}
 		if(SSL_inspection_unlikely(SSL_inspection_session_flush_buffer(s_session, 1) == (-1))) {
 			if(s_main_context->m_is_verbose >= 1) {
-				(void)SSL_inspection_fprintf(stderr, "flush backward buffer failed on FIN (fd=%d)\n",
-					s_session->m_accept_socket);
+				(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sflush backward buffer failed on FIN%s\n",
+					sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n);
 			}
 		}
 
@@ -2150,6 +3138,7 @@ int SSL_inspection_session_fill_buffer(SSL_inspection_session_t *s_session, int 
 
 	SSL_inspection_trace_transfer(
 		s_main_context,
+		s_session->m_accept_socket,
 		(s_from_accept_side != 0) ? "From accept rx" : "From connect rx",
 		(s_from_accept_side != 0) ? s_session->m_accept_socket : s_session->m_connect_socket,
 		(s_from_accept_side != 0) ? s_session->m_forward_transfer_size : s_session->m_backward_transfer_size,
@@ -2384,7 +3373,7 @@ int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_work
 		(void)inet_ntop(s_session->m_sockaddr_accept.ss_family, (const void *)(&s_sockaddr_in6->sin6_addr), (char *)(&s_session->m_accept_address_string[0]), (socklen_t)sizeof(s_session->m_accept_address_string));
 	}
 	else {
-		(void)SSL_inspection_fprintf(stderr, "BUG: invalid accept address family ! (family=%u)\n", (unsigned int)s_session->m_sockaddr_accept.ss_family);
+		(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sBUG: invalid accept address family%s (family=%u)\n", sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n, (unsigned int)s_session->m_sockaddr_accept.ss_family);
 		errno = EINVAL;
 		return(-1);
 	}
@@ -2428,46 +3417,44 @@ int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_work
 				s_session->m_flags |= def_SSL_inspection_session_flag_tproxy_no_spoof;
 				if(s_main_context->m_is_verbose >= 1) {
 					(void)SSL_inspection_fprintf(stderr,
-						"TPROXY: self-address detected (fd=%d, \"[%s]:%d\"), fallback to \"%s:%d\"\n",
-						s_session->m_accept_socket, s_orig_dst_str, s_orig_port,
+						"%s[C-fd=%d]%s TPROXY: self-address \"[%s]:%d\", fallback to \"%s:%d\"\n",
+						sg_ce_c, s_session->m_accept_socket, sg_ce_n, s_orig_dst_str, s_orig_port,
 						s_main_context->m_connect_address, s_main_context->m_connect_port);
 				}
 			}
 			else {
 				/* No -B → routing misconfiguration, reject immediately */
 				(void)SSL_inspection_fprintf(stderr,
-					"TPROXY: self-address detected (fd=%d, \"[%s]:%d\"), no -B fallback — closing\n",
-					s_session->m_accept_socket, s_orig_dst_str, s_orig_port);
+					"%s[C-fd=%d]%s %sTPROXY: self-address \"[%s]:%d\", no -B fallback — closing%s\n",
+					sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, s_orig_dst_str, s_orig_port, sg_ce_n);
 				return(-1);
 			}
 		}
 		else if(s_main_context->m_is_verbose >= 1) {
 			(void)SSL_inspection_fprintf(stdout,
-				"TPROXY: original dst (fd=%d, \"[%s]:%d\")\n",
-				s_session->m_accept_socket, s_orig_dst_str, s_orig_port);
+				"%s[C-fd=%d]%s TPROXY: original dst \"[%s]:%d\"\n",
+				sg_co_c, s_session->m_accept_socket, sg_co_n, s_orig_dst_str, s_orig_port);
 		}
 	}
 
 	if(s_main_context->m_is_verbose >= 1) {
+		char s_tuple[128];
+		SSL_inspection_session_format_tuple(s_session, s_tuple, sizeof(s_tuple));
 #if defined(def_sslid_use_dpdk_lcore)
-		(void)SSL_inspection_fprintf(
-			stdout,
-			"Accepted (fd=%d, socket_flags=0x%x%s, accept-from=\"%s\", worker_index=%u, lcore_id=%u)\n",
-			s_session->m_accept_socket,
-			s_session->m_accept_socket_flags,
-			((s_session->m_accept_socket_flags & O_NONBLOCK) == O_NONBLOCK) ? "[NONBLOCK]" : "[BLOCK]",
-			(char *)(&s_session->m_accept_address_string[0]),
+		(void)SSL_inspection_fprintf(stdout,
+			"%s[C-fd=%d]%s %sAccepted%s %s (worker_index=%u, lcore_id=%u)\n",
+			sg_co_c, s_session->m_accept_socket, sg_co_n,
+			sg_co_g, sg_co_n,
+			s_tuple,
 			s_worker_context->m_worker_index,
 			s_worker_context->m_lcore_id
 		);
 #else
-		(void)SSL_inspection_fprintf(
-			stdout,
-			"Accepted (fd=%d, socket_flags=0x%x%s, accept-from=\"%s\", worker_index=%u)\n",
-			s_session->m_accept_socket,
-			s_session->m_accept_socket_flags,
-			((s_session->m_accept_socket_flags != (-1)) && ((s_session->m_accept_socket_flags & O_NONBLOCK) == O_NONBLOCK)) ? "[NONBLOCK]" : "[BLOCK]",
-			(char *)(&s_session->m_accept_address_string[0]),
+		(void)SSL_inspection_fprintf(stdout,
+			"%s[C-fd=%d]%s %sAccepted%s %s (worker_index=%u)\n",
+			sg_co_c, s_session->m_accept_socket, sg_co_n,
+			sg_co_g, sg_co_n,
+			s_tuple,
 			s_worker_context->m_worker_index
 		);
 #endif
@@ -2502,7 +3489,7 @@ int SSL_inspection_prepare_session_async(SSL_inspection_worker_context_t *s_work
 		/* auto_detect 모드: m_connect_ssl_ctx는 TLS 확정 후 drive()에서 설정 */
 		s_session->m_connect_ssl_ctx = s_main_context->m_client_ssl_ctx;
 		if(SSL_inspection_unlikely(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL)))) {
-			(void)SSL_inspection_fprintf(stderr, "client SSL_CTX not initialized ! (connect)\n");
+			(void)SSL_inspection_fprintf(stderr, "%s[C-fd=%d]%s %sclient SSL_CTX not initialized (connect)%s\n", sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n);
 			return(-1);
 		}
 	}
@@ -2560,40 +3547,19 @@ static int SSL_inspection_session_initiate_connect(SSL_inspection_session_t *s_s
 	s_main_context = s_session->m_main_context;
 
 	if(s_main_context->m_is_verbose >= 1) {
-		if(s_main_context->m_use_tproxy != 0) {
-			char s_dst_str[INET6_ADDRSTRLEN] = {0};
-			int s_dst_port = 0;
-			if(s_session->m_sockaddr_original_dst.ss_family == AF_INET) {
-				(void)inet_ntop(AF_INET, &((struct sockaddr_in *)(&s_session->m_sockaddr_original_dst))->sin_addr,
-					s_dst_str, (socklen_t)sizeof(s_dst_str));
-				s_dst_port = (int)ntohs(((struct sockaddr_in *)(&s_session->m_sockaddr_original_dst))->sin_port);
-			}
-			else if(s_session->m_sockaddr_original_dst.ss_family == AF_INET6) {
-				(void)inet_ntop(AF_INET6, &((struct sockaddr_in6 *)(&s_session->m_sockaddr_original_dst))->sin6_addr,
-					s_dst_str, (socklen_t)sizeof(s_dst_str));
-				s_dst_port = (int)ntohs(((struct sockaddr_in6 *)(&s_session->m_sockaddr_original_dst))->sin6_port);
-			}
-			(void)SSL_inspection_fprintf(stdout,
-				"%s connecting[tproxy]%s%s%s. (for fd=%d, \"[%s]:%d\")\n",
-				(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? "TCP" : "SSL",
-				(s_session->m_sni_hostname[0] != '\0') ? " sni=\"" : "",
-				(s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "",
-				(s_session->m_sni_hostname[0] != '\0') ? "\"" : "",
-				s_session->m_accept_socket, s_dst_str, s_dst_port);
-		}
-		else {
-			(void)SSL_inspection_fprintf(
-				stdout,
-				"%s connecting%s%s%s. (for fd=%d, \"[%s]:%d\")\n",
-				(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? "TCP" : "SSL",
-				(s_session->m_sni_hostname[0] != '\0') ? " sni=\"" : "",
-				(s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "",
-				(s_session->m_sni_hostname[0] != '\0') ? "\"" : "",
-				s_session->m_accept_socket,
-				s_main_context->m_connect_address,
-				s_main_context->m_connect_port
-			);
-		}
+		char s_tuple[128];
+		SSL_inspection_session_format_tuple(s_session, s_tuple, sizeof(s_tuple));
+		(void)SSL_inspection_fprintf(stdout,
+			"%s[C-fd=%d]%s %s %sconnecting%s%s%s%s%s. %s\n",
+			sg_co_c, s_session->m_accept_socket, sg_co_n,
+			(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL))) ? "TCP" : "SSL",
+			sg_co_g, sg_co_n,
+			(s_main_context->m_use_tproxy != 0) ? "[tproxy]" : "",
+			(s_session->m_sni_hostname[0] != '\0') ? " sni=\"" : "",
+			(s_session->m_sni_hostname[0] != '\0') ? s_session->m_sni_hostname : "",
+			(s_session->m_sni_hostname[0] != '\0') ? "\"" : "",
+			s_tuple
+		);
 	}
 
 	/* SOCK_NONBLOCK|SOCK_CLOEXEC set atomically, saving 2 fcntl syscalls per connection */
@@ -2745,8 +3711,9 @@ int SSL_inspection_session_ktls_activate(SSL_inspection_session_t *s_session)
 		s_session->m_ktls_active = 0;
 		if(s_main_context->m_is_verbose >= 1) {
 			(void)SSL_inspection_fprintf(stdout,
-				"kTLS: fallback to userspace relay (accept_fd=%d, connect_fd=%d, fwd_rx=%s, fwd_tx=%s, bwd_rx=%s, bwd_tx=%s)\n",
-				s_session->m_accept_socket, s_session->m_connect_socket,
+				"%s[C-fd=%d]%s kTLS: fallback to userspace relay (%sS-fd=%d%s, fwd_rx=%s, fwd_tx=%s, bwd_rx=%s, bwd_tx=%s)\n",
+				sg_co_c, s_session->m_accept_socket, sg_co_n,
+				sg_co_y, s_session->m_connect_socket, sg_co_n,
 				s_fwd_rx_ktls ? "on" : "off", s_fwd_tx_ktls ? "on" : "off",
 				s_bwd_rx_ktls ? "on" : "off", s_bwd_tx_ktls ? "on" : "off"
 			);
@@ -2759,8 +3726,9 @@ int SSL_inspection_session_ktls_activate(SSL_inspection_session_t *s_session)
 	if(s_main_context->m_use_splice <= 0) {
 		if(s_main_context->m_is_verbose >= 1) {
 			(void)SSL_inspection_fprintf(stdout,
-				"kTLS: active (accept_fd=%d, connect_fd=%d), splice: off\n",
-				s_session->m_accept_socket, s_session->m_connect_socket
+				"%s[C-fd=%d]%s kTLS: active (%sS-fd=%d%s), splice: off\n",
+				sg_co_c, s_session->m_accept_socket, sg_co_n,
+				sg_co_y, s_session->m_connect_socket, sg_co_n
 			);
 		}
 		return(0); /* kTLS active, splice not requested */
@@ -2772,8 +3740,9 @@ int SSL_inspection_session_ktls_activate(SSL_inspection_session_t *s_session)
 		s_session->m_ktls_active = 0; /* C-1: fall back to userspace relay; don't kill session */
 		if(s_main_context->m_is_verbose >= 1) {
 			(void)SSL_inspection_fprintf(stdout,
-				"kTLS: active (accept_fd=%d, connect_fd=%d), splice: pipe creation failed, fallback to userspace relay\n",
-				s_session->m_accept_socket, s_session->m_connect_socket
+				"%s[C-fd=%d]%s kTLS: active (%sS-fd=%d%s), splice: pipe creation failed, fallback to userspace relay\n",
+				sg_co_c, s_session->m_accept_socket, sg_co_n,
+				sg_co_y, s_session->m_connect_socket, sg_co_n
 			);
 		}
 		return(0);
@@ -2789,8 +3758,9 @@ int SSL_inspection_session_ktls_activate(SSL_inspection_session_t *s_session)
 		s_session->m_ktls_active = 0;
 		if(s_main_context->m_is_verbose >= 1) {
 			(void)SSL_inspection_fprintf(stdout,
-				"kTLS: active (accept_fd=%d, connect_fd=%d), splice: pipe creation failed, fallback to userspace relay\n",
-				s_session->m_accept_socket, s_session->m_connect_socket
+				"%s[C-fd=%d]%s kTLS: active (%sS-fd=%d%s), splice: pipe creation failed, fallback to userspace relay\n",
+				sg_co_c, s_session->m_accept_socket, sg_co_n,
+				sg_co_y, s_session->m_connect_socket, sg_co_n
 			);
 		}
 		return(0); /* M-4: fall back to userspace relay; m_ktls_active=0 disables splice path */
@@ -2801,8 +3771,9 @@ int SSL_inspection_session_ktls_activate(SSL_inspection_session_t *s_session)
 
 	if(s_main_context->m_is_verbose >= 1) {
 		(void)SSL_inspection_fprintf(stdout,
-			"kTLS: active (accept_fd=%d, connect_fd=%d), splice: active\n",
-			s_session->m_accept_socket, s_session->m_connect_socket
+			"%s[C-fd=%d]%s kTLS: active (%sS-fd=%d%s), splice: active\n",
+			sg_co_c, s_session->m_accept_socket, sg_co_n,
+			sg_co_y, s_session->m_connect_socket, sg_co_n
 		);
 	}
 
@@ -2878,6 +3849,7 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 		if(s_n > (ssize_t)0) {
 			s_session->m_fwd_pipe_pending -= (size_t)s_n;
 			s_session->m_forward_transfer_size += (unsigned long long)s_n;
+			s_session->m_forward_transfer_count++;
 			if(s_session->m_worker_context != ((SSL_inspection_worker_context_t *)(NULL))) {
 				s_session->m_worker_context->m_forward_transfer_size += (unsigned long long)s_n;
 			}
@@ -2939,6 +3911,7 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 		if(s_n > (ssize_t)0) {
 			s_session->m_bwd_pipe_pending -= (size_t)s_n;
 			s_session->m_backward_transfer_size += (unsigned long long)s_n;
+			s_session->m_backward_transfer_count++;
 			if(s_session->m_worker_context != ((SSL_inspection_worker_context_t *)(NULL))) {
 				s_session->m_worker_context->m_backward_transfer_size += (unsigned long long)s_n;
 			}
@@ -2985,8 +3958,9 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 				if(s_check > 0) {
 					if(s_main_context->m_is_verbose >= 1) {
 						(void)SSL_inspection_fprintf(stdout,
-							"auto-detect: server connected (connect_fd=%d, accept_fd=%d)\n",
-							s_session->m_connect_socket, s_session->m_accept_socket);
+							"%s[C-fd=%d]%s auto-detect: server connected (%sS-fd=%d%s)\n",
+							sg_co_c, s_session->m_accept_socket, sg_co_n,
+							sg_co_y, s_session->m_connect_socket, sg_co_n);
 					}
 					s_progress = 1;
 				}
@@ -3006,8 +3980,9 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					s_session->m_backward_pending_offset = 0u;
 					if(s_main_context->m_is_verbose >= 1) {
 						(void)SSL_inspection_fprintf(stdout,
-							"auto-detect: server banner buffered (%zd bytes, connect_fd=%d)\n",
-							s_n, s_session->m_connect_socket);
+							"%s[C-fd=%d]%s auto-detect: server banner buffered (%zd bytes, %sS-fd=%d%s)\n",
+							sg_co_c, s_session->m_accept_socket, sg_co_n,
+							s_n, sg_co_y, s_session->m_connect_socket, sg_co_n);
 					}
 					s_progress = 1;
 				}
@@ -3033,8 +4008,8 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 						s_session->m_flags |= def_SSL_inspection_session_flag_tcp_relay;
 						if(s_main_context->m_is_verbose >= 1) {
 							(void)SSL_inspection_fprintf(stdout,
-								"auto-detect: peek timeout → TCP relay (fd=%d)\n",
-								s_session->m_accept_socket);
+								"%s[C-fd=%d]%s auto-detect: peek timeout → TCP relay\n",
+								sg_co_c, s_session->m_accept_socket, sg_co_n);
 						}
 						s_progress = 1;
 					}
@@ -3048,8 +4023,8 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					 * 비정상 서버가 데이터를 보냈더라도 SSL_connect로 새 핸드셰이크 시작. */
 					if(s_session->m_backward_pending_size > 0u) {
 						(void)SSL_inspection_fprintf(stderr,
-							"auto-detect: TLS detected — discarding %zu pre-handshake server bytes (fd=%d)\n",
-							s_session->m_backward_pending_size, s_session->m_accept_socket);
+							"%s[C-fd=%d]%s auto-detect: TLS detected — discarding %zu pre-handshake server bytes\n",
+							sg_ce_c, s_session->m_accept_socket, sg_ce_n, s_session->m_backward_pending_size);
 						s_session->m_backward_pending_size   = 0u;
 						s_session->m_backward_pending_offset = 0u;
 					}
@@ -3058,7 +4033,8 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					s_session->m_connect_ssl_ctx = s_main_context->m_client_ssl_ctx;
 					if(SSL_inspection_unlikely(s_session->m_connect_ssl_ctx == ((SSL_CTX *)(NULL)))) {
 						(void)SSL_inspection_fprintf(stderr,
-							"auto-detect: client SSL_CTX not initialized !\n");
+							"%s[C-fd=%d]%s %sauto-detect: client SSL_CTX not initialized !%s\n",
+							sg_ce_c, s_session->m_accept_socket, sg_ce_n, sg_ce_r, sg_ce_n);
 						return(-1);
 					}
 
@@ -3067,28 +4043,30 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					   SSL_inspection_unlikely(SSL_inspection_sni_is_loopback(s_session->m_sni_hostname) != 0)) {
 						if(s_main_context->m_is_verbose >= 1) {
 							(void)SSL_inspection_fprintf(stderr,
-								"auto-detect: SNI loopback ignored: \"%s\" (fd=%d)\n",
-								s_session->m_sni_hostname, s_session->m_accept_socket);
+								"%s[C-fd=%d]%s auto-detect: SNI loopback ignored: \"%s%s%s\"\n",
+								sg_ce_c, s_session->m_accept_socket, sg_ce_n,
+								sg_ce_y, s_session->m_sni_hostname, sg_ce_n);
 						}
 						s_session->m_sni_hostname[0] = '\0';
 					}
 
-					/* per-SNI 인증서 생성 */
+					/* per-SNI 인증서 생성 (2단 캐시 → CA 서명 leaf cert) */
 					if((s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) &&
 					   (s_session->m_sni_hostname[0] != '\0')) {
 						if(s_main_context->m_is_verbose >= 1) {
 							(void)SSL_inspection_fprintf(stdout,
-								"auto-detect: TLS, sni=\"%s\" → per-session cert (fd=%d)\n",
-								s_session->m_sni_hostname, s_session->m_accept_socket);
+								"%s[C-fd=%d]%s auto-detect: TLS, sni=\"%s%s%s\" → per-session cert\n",
+								sg_co_c, s_session->m_accept_socket, sg_co_n,
+								sg_co_y, s_session->m_sni_hostname, sg_co_n);
 						}
-						s_session->m_accept_ssl_ctx = SSL_inspection_new_SSL_CTX(
-							s_main_context, 1, s_session->m_sni_hostname);
+						s_session->m_accept_ssl_ctx = ssl_inspection_get_or_create_sni_ssl_ctx(
+							s_main_context, s_session->m_worker_context, s_session->m_accept_socket, s_session->m_sni_hostname);
 						if(SSL_inspection_unlikely(s_session->m_accept_ssl_ctx == ((SSL_CTX *)(NULL)))) return(-1);
 					}
 					else if(s_main_context->m_is_verbose >= 1) {
 						(void)SSL_inspection_fprintf(stdout,
-							"auto-detect: TLS, no SNI → global cert (fd=%d)\n",
-							s_session->m_accept_socket);
+							"%s[C-fd=%d]%s auto-detect: TLS, no SNI → global cert\n",
+							sg_co_c, s_session->m_accept_socket, sg_co_n);
 					}
 					s_progress = 1;
 				}
@@ -3097,8 +4075,8 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					s_session->m_flags |= def_SSL_inspection_session_flag_tcp_relay;
 					if(s_main_context->m_is_verbose >= 1) {
 						(void)SSL_inspection_fprintf(stdout,
-							"auto-detect: non-TLS → TCP relay (fd=%d)\n",
-							s_session->m_accept_socket);
+							"%s[C-fd=%d]%s auto-detect: non-TLS → TCP relay\n",
+							sg_co_c, s_session->m_accept_socket, sg_co_n);
 					}
 					s_progress = 1;
 				}
@@ -3114,8 +4092,8 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 				s_session->m_flags |= def_SSL_inspection_session_flag_tcp_relay;
 				if(s_main_context->m_is_verbose >= 1) {
 					(void)SSL_inspection_fprintf(stdout,
-						"auto-detect: server FIN with buffered banner — TCP relay (fd=%d)\n",
-						s_session->m_accept_socket);
+						"%s[C-fd=%d]%s auto-detect: server FIN with buffered banner — TCP relay\n",
+						sg_co_c, s_session->m_accept_socket, sg_co_n);
 				}
 				s_progress = 1;
 			}
@@ -3127,16 +4105,16 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 					s_session->m_state = def_SSL_inspection_session_state_connect_ssl_handshake;
 					if(s_main_context->m_is_verbose >= 1) {
 						(void)SSL_inspection_fprintf(stdout,
-							"auto-detect: → SSL inspection (fd=%d)\n",
-							s_session->m_accept_socket);
+							"%s[C-fd=%d]%s auto-detect: → SSL inspection\n",
+							sg_co_c, s_session->m_accept_socket, sg_co_n);
 					}
 				}
 				else {
 					s_session->m_state = def_SSL_inspection_session_state_stream;
 					if(s_main_context->m_is_verbose >= 1) {
 						(void)SSL_inspection_fprintf(stdout,
-							"auto-detect: → TCP relay stream (buffered=%zu bytes, fd=%d)\n",
-							s_session->m_backward_pending_size, s_session->m_accept_socket);
+							"%s[C-fd=%d]%s auto-detect: → TCP relay stream (buffered=%zu bytes)\n",
+							sg_co_c, s_session->m_accept_socket, sg_co_n, s_session->m_backward_pending_size);
 					}
 				}
 				s_progress = 1;
@@ -3156,8 +4134,8 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 				if(s_elapsed < (uint64_t)s_main_context->m_peek_timeout_ms) break;
 				if(s_main_context->m_is_verbose >= 1) {
 					(void)SSL_inspection_fprintf(stdout,
-						"SNI peek: timeout — connecting without SNI (fd=%d)\n",
-						s_session->m_accept_socket);
+						"%s[C-fd=%d]%s SNI peek: timeout — connecting without SNI\n",
+						sg_co_c, s_session->m_accept_socket, sg_co_n);
 				}
 				/* fall through: connect without SNI */
 			}
@@ -3168,28 +4146,31 @@ int SSL_inspection_session_drive(SSL_inspection_session_t *s_session)
 			   (SSL_inspection_unlikely(SSL_inspection_sni_is_loopback(s_session->m_sni_hostname) != 0))) {
 				if(s_main_context->m_is_verbose >= 1) {
 					(void)SSL_inspection_fprintf(stderr,
-						"SNI loopback ignored: \"%s\" (fd=%d)\n",
-						s_session->m_sni_hostname, s_session->m_accept_socket);
+						"%s[C-fd=%d]%s SNI loopback ignored: \"%s%s%s\"\n",
+						sg_ce_c, s_session->m_accept_socket, sg_ce_n,
+						sg_ce_y, s_session->m_sni_hostname, sg_ce_n);
 				}
 				s_session->m_sni_hostname[0] = '\0';
 			}
 
-			/* SNI가 있을 때만 세션별 인증서 생성.
+			/* SNI가 있을 때만 세션별 인증서 생성 (2단 캐시 → CA 서명 leaf cert).
 			 * SNI 없으면 m_accept_ssl_ctx = NULL → ensure_ssl에서 전역 m_ssl_ctx 사용. */
 			if((s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) &&
 			   (s_session->m_sni_hostname[0] != '\0')) {
 				if(s_main_context->m_is_verbose >= 1) {
 					(void)SSL_inspection_fprintf(stdout,
-						"SNI peek: \"%s\" -> per-session CN (fd=%d)\n",
-						s_session->m_sni_hostname, s_session->m_accept_socket);
+						"%s[C-fd=%d]%s SNI peek: \"%s%s%s\" -> per-session CN\n",
+						sg_co_c, s_session->m_accept_socket, sg_co_n,
+						sg_co_y, s_session->m_sni_hostname, sg_co_n);
 				}
-				s_session->m_accept_ssl_ctx = SSL_inspection_new_SSL_CTX(s_main_context, 1, s_session->m_sni_hostname);
+				s_session->m_accept_ssl_ctx = ssl_inspection_get_or_create_sni_ssl_ctx(
+					s_main_context, s_session->m_worker_context, s_session->m_accept_socket, s_session->m_sni_hostname);
 				if(SSL_inspection_unlikely(s_session->m_accept_ssl_ctx == ((SSL_CTX *)(NULL)))) return(-1);
 			}
 			else if((s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) && (s_main_context->m_is_verbose >= 1)) {
 				(void)SSL_inspection_fprintf(stdout,
-					"SNI peek: (none) -> global cert (fd=%d)\n",
-					s_session->m_accept_socket);
+					"%s[C-fd=%d]%s SNI peek: (none) -> global cert\n",
+					sg_co_c, s_session->m_accept_socket, sg_co_n);
 			}
 			/* initiate_connect()가 m_state를 connecting/connect_ssl_handshake로 전진시킴 */
 			if(SSL_inspection_unlikely(SSL_inspection_session_initiate_connect(s_session) != 0)) return(-1);
@@ -3496,6 +4477,7 @@ int SSL_inspection_add_worker(SSL_inspection_main_context_t *s_main_context, uns
 		.m_forward_transfer_size = 0ull,
 		.m_backward_transfer_size = 0ull,
 	};
+	ssl_cert_cache_local_init(&s_worker_context->m_cert_cache_local);
 	(void)memset((void *)(&s_worker_context[1]), 0, sizeof(struct epoll_event) * (size_t)s_max_worker_epoll_events);
 	if(SSL_inspection_unlikely(s_worker_context->m_epoll_fd == (-1))) {
 		SSL_inspection_perror("worker epoll_create1");
@@ -3635,6 +4617,9 @@ SSL_inspection_worker_context_t *SSL_inspection_free_worker(SSL_inspection_worke
 		}
 		s_worker_context->m_listen_socket = (-1);
 	}
+
+	/* Release per-worker cert cache (all sessions on this worker have been freed above) */
+	ssl_cert_cache_local_destroy(&s_worker_context->m_cert_cache_local);
 
 	free((void *)s_worker_context);
 
@@ -4222,12 +5207,32 @@ int main(int s_argc, char **s_argv)
 		.m_client_ssl_method = (const SSL_METHOD *)(NULL),
 		.m_ssl_ctx = (SSL_CTX *)(NULL),
 		.m_client_ssl_ctx = (SSL_CTX *)(NULL),
+		.m_ca_pkey = (EVP_PKEY *)(NULL),
+		.m_ca_x509 = (X509 *)(NULL),
+		.m_cert_cache = (ssl_cert_cache_global_t *)(NULL),
 		.m_sockaddr_connect_bind = {},
 		.m_socklen_connect_bind = (socklen_t)sizeof(s_main_context->m_sockaddr_connect_bind),
 		.m_sockaddr_connect = {},
 		.m_socklen_connect = (socklen_t)sizeof(s_main_context->m_sockaddr_connect),
 		.m_magic_code_end = 0x87654321u,
 	};
+
+	/* Initialize runtime color strings based on TTY detection */
+	if(isatty(STDOUT_FILENO)) {
+		sg_co_n = def_hwport_color_normal;
+		sg_co_c = def_hwport_color_cyan;
+		sg_co_y = def_hwport_color_yellow;
+		sg_co_g = def_hwport_color_green;
+		sg_co_m = def_hwport_color_magenta;
+		sg_co_w = def_hwport_color_white;
+	}
+	if(isatty(STDERR_FILENO)) {
+		sg_ce_n = def_hwport_color_normal;
+		sg_ce_c = def_hwport_color_cyan;
+		sg_ce_r = def_hwport_color_red;
+		sg_ce_y = def_hwport_color_yellow;
+	}
+
 	if(s_main_context->m_cpu_count <= 0) {
 		cpu_set_t s_cpuset;
 
@@ -4757,6 +5762,14 @@ int main(int s_argc, char **s_argv)
 		}
 
 		if(s_main_context->m_use_ssl != 0) {
+			/* Setup CA key+cert + global cert cache (must precede SSL_CTX creation) */
+			if(SSL_inspection_unlikely(ssl_inspection_setup_ca(s_main_context) != 0)) {
+				(void)SSL_inspection_fprintf(stderr, "CA setup failed !\n");
+				s_main_context->m_exit_code = EXIT_FAILURE;
+				goto l_return;
+			}
+
+			/* Global server SSL_CTX: uses CA cert as no-SNI fallback */
 			s_main_context->m_ssl_ctx = SSL_inspection_new_SSL_CTX(s_main_context, 1 /* server side */, NULL);
 			if(SSL_inspection_unlikely(s_main_context->m_ssl_ctx == ((SSL_CTX *)(NULL)))) {
 				(void)SSL_inspection_fprintf(stderr, "SSL_inspection_new_SSL_CTX failed !\n");
@@ -5029,6 +6042,21 @@ l_return:;
 	if(s_main_context->m_ssl_ctx != ((SSL_CTX *)(NULL))) {
 		if(s_main_context->m_is_verbose >= 0) {
 			(void)SSL_inspection_fprintf(stdout, "Cleanup OpenSSL...\n");
+		}
+
+		/* Global cert cache: destroy AFTER all workers have joined (and freed local caches).
+		 * Any SSL_CTX created from cached certs has already been freed with its sessions. */
+		if(s_main_context->m_cert_cache != ((ssl_cert_cache_global_t *)(NULL))) {
+			ssl_cert_cache_global_destroy(s_main_context->m_cert_cache);
+			s_main_context->m_cert_cache = (ssl_cert_cache_global_t *)(NULL);
+		}
+		if(s_main_context->m_ca_x509 != ((X509 *)(NULL))) {
+			X509_free(s_main_context->m_ca_x509);
+			s_main_context->m_ca_x509 = (X509 *)(NULL);
+		}
+		if(s_main_context->m_ca_pkey != ((EVP_PKEY *)(NULL))) {
+			EVP_PKEY_free(s_main_context->m_ca_pkey);
+			s_main_context->m_ca_pkey = (EVP_PKEY *)(NULL);
 		}
 
 		if(s_main_context->m_client_ssl_ctx != ((SSL_CTX *)(NULL))) {
