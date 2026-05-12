@@ -5198,6 +5198,11 @@ int main(int s_argc, char **s_argv)
 #if (OPENSSL_VERSION_NUMBER < 0x30000000L) && !defined(OPENSSL_NO_ENGINE)
 		.m_engine = (ENGINE *)(NULL),
 #endif
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+		.m_provider_count   = (size_t)0u,
+		.m_provider_default = (OSSL_PROVIDER *)(NULL),
+		.m_provider_props   = (const char *)(NULL),
+#endif
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
 		.m_ssl_options = 0UL,
 #else
@@ -5287,6 +5292,8 @@ int main(int s_argc, char **s_argv)
 			{"tproxy", no_argument, (int *)(NULL), 0},
 			{"auto-detect-tls", no_argument,       (int *)(NULL), 0},
 			{"peek-timeout",    required_argument, (int *)(NULL), 0},
+			{"provider",        required_argument, (int *)(NULL), 0},
+			{"provider-props",  required_argument, (int *)(NULL), 0},
 			{(char *)(NULL), 0, (int *)(NULL), 0}
 		};
 		int s_option_index;
@@ -5384,6 +5391,26 @@ int main(int s_argc, char **s_argv)
 							s_main_context->m_peek_timeout_ms = (int)s_value;
 						}
 					}
+					else if(strcmp(sg_options[s_option_index].name, "provider") == 0) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+						if(s_main_context->m_provider_count < (size_t)def_SSL_inspection_max_providers) {
+							s_main_context->m_provider_names[s_main_context->m_provider_count++] = optarg;
+						}
+						else {
+							(void)SSL_inspection_fprintf(stderr, "too many --provider options (max %d)\n", def_SSL_inspection_max_providers);
+							s_main_context->m_is_help = 1;
+						}
+#else
+						(void)SSL_inspection_fprintf(stderr, "WARNING: --provider requires OpenSSL 3.x+, ignored\n");
+#endif
+					}
+					else if(strcmp(sg_options[s_option_index].name, "provider-props") == 0) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+						s_main_context->m_provider_props = optarg;
+#else
+						(void)SSL_inspection_fprintf(stderr, "WARNING: --provider-props requires OpenSSL 3.x+, ignored\n");
+#endif
+					}
 					else { /* unknown option (unlikely) */
 						(void)SSL_inspection_fprintf(stderr, "unknown option \"%s\" !\n", sg_options[s_option_index].name);
 						s_main_context->m_is_help = 1;
@@ -5477,6 +5504,13 @@ int main(int s_argc, char **s_argv)
 				"\t                              connect server immediately then peek client first bytes;\n"
 				"\t                              TLS ClientHello → SSL MITM, otherwise → plain TCP relay\n"
 				"\t    --peek-timeout=<ms>     : server-speaks-first fallback timeout (default: 3000ms)\n"
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+				"\t    --provider=<name>       : load OpenSSL 3.x provider (repeatable,\n"
+				"\t                              e.g. --provider default --provider qatprovider)\n"
+				"\t                              \"default\" is always loaded as SW fallback\n"
+				"\t    --provider-props=<str>  : EVP property query string for operation routing\n"
+				"\t                              (e.g. --provider-props '?provider=qatprovider')\n"
+#endif
 				"\n",
 				s_main_context->m_program_name,
 				__DATE__,
@@ -5510,6 +5544,9 @@ int main(int s_argc, char **s_argv)
 #if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 		", ktls=%s, splice=%s"
 #endif
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+		", providers=%zu, provider-props=\"%s\""
+#endif
 		", tproxy=%s"
 		")\n"
 		"\n",
@@ -5532,6 +5569,10 @@ int main(int s_argc, char **s_argv)
 #if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 		(s_main_context->m_use_ktls > 0) ? "on" : "off",
 		(s_main_context->m_use_splice > 0) ? "on" : "off",
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+		s_main_context->m_provider_count,
+		(s_main_context->m_provider_props != NULL) ? s_main_context->m_provider_props : "",
 #endif
 		(s_main_context->m_use_tproxy > 0) ? "on" : "off"
 	);
@@ -5663,6 +5704,60 @@ int main(int s_argc, char **s_argv)
 				/* M-6: ENGINE_finish() deferred to cleanup; releasing functional ref here
 				 * would allow the engine to be unloaded while still in use by OpenSSL. */
 				}
+			}
+		}
+#endif
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+		if(s_main_context->m_provider_count > (size_t)0u) {
+			size_t s_pi;
+
+			/* Explicit provider loading disables implicit "default" activation.
+			 * Always load "default" first so SW fallback (AES-GCM, SHA, RSA, …)
+			 * remains available even when hardware providers take priority. */
+			s_main_context->m_provider_default = OSSL_PROVIDER_load(NULL, "default");
+			if(SSL_inspection_unlikely(s_main_context->m_provider_default == NULL)) {
+				(void)fflush(stdout);
+				(void)SSL_inspection_fprintf(stderr, "Failed to load provider: \"default\" (SW fallback)!\n");
+				s_main_context->m_exit_code = EXIT_FAILURE;
+				goto l_return;
+			}
+			if(s_main_context->m_is_verbose >= 0) {
+				(void)SSL_inspection_fprintf(stdout, "Loaded provider: \"default\" (SW fallback)\n");
+			}
+
+			for(s_pi = (size_t)0u; s_pi < s_main_context->m_provider_count; s_pi++) {
+				const char *s_pname = s_main_context->m_provider_names[s_pi];
+				if(strcmp(s_pname, "default") == 0) {
+					/* reuse the handle already loaded above */
+					s_main_context->m_providers[s_pi] = s_main_context->m_provider_default;
+					continue;
+				}
+				if(s_main_context->m_is_verbose >= 0) {
+					(void)SSL_inspection_fprintf(stdout, "Loading provider: \"%s\"\n", s_pname);
+					(void)fflush(stdout);
+				}
+				s_main_context->m_providers[s_pi] = OSSL_PROVIDER_load(NULL, s_pname);
+				if(SSL_inspection_unlikely(s_main_context->m_providers[s_pi] == NULL)) {
+					(void)SSL_inspection_fprintf(stderr, "Failed to load provider: \"%s\"!\n", s_pname);
+					s_main_context->m_exit_code = EXIT_FAILURE;
+					goto l_return;
+				}
+				if(s_main_context->m_is_verbose >= 0) {
+					(void)SSL_inspection_fprintf(stdout, "Loaded provider: \"%s\"\n", s_pname);
+				}
+			}
+		}
+
+		if(s_main_context->m_provider_props != NULL) {
+			if(SSL_inspection_unlikely(EVP_set_default_properties(NULL, s_main_context->m_provider_props) <= 0)) {
+				(void)fflush(stdout);
+				(void)SSL_inspection_fprintf(stderr, "EVP_set_default_properties(\"%s\") failed!\n", s_main_context->m_provider_props);
+				s_main_context->m_exit_code = EXIT_FAILURE;
+				goto l_return;
+			}
+			if(s_main_context->m_is_verbose >= 0) {
+				(void)SSL_inspection_fprintf(stdout, "EVP default properties: \"%s\"\n", s_main_context->m_provider_props);
 			}
 		}
 #endif
@@ -6072,6 +6167,23 @@ l_return:;
 			ENGINE_finish(s_main_context->m_engine); /* M-6: release functional ref before structural */
 			ENGINE_free(s_main_context->m_engine);
 			s_main_context->m_engine = (ENGINE *)(NULL);
+		}
+#endif
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+		{
+			size_t s_pi;
+			for(s_pi = (size_t)0u; s_pi < s_main_context->m_provider_count; s_pi++) {
+				if((s_main_context->m_providers[s_pi] != NULL) &&
+				   (s_main_context->m_providers[s_pi] != s_main_context->m_provider_default)) {
+					OSSL_PROVIDER_unload(s_main_context->m_providers[s_pi]);
+					s_main_context->m_providers[s_pi] = (OSSL_PROVIDER *)(NULL);
+				}
+			}
+			if(s_main_context->m_provider_default != NULL) {
+				OSSL_PROVIDER_unload(s_main_context->m_provider_default);
+				s_main_context->m_provider_default = (OSSL_PROVIDER *)(NULL);
+			}
 		}
 #endif
 

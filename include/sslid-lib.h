@@ -261,6 +261,8 @@ typedef struct mystruct {
 
 #define def_SSL_inspection_buffer_size (1 << 14) /* limited 16KBytes : maximum TLS record size */
 
+#define def_SSL_inspection_max_providers 16 /* maximum --provider entries */
+
 #define SSL_inspection_main_context_t __SSL_inspection_main_context_t
 typedef struct SSL_inspection_main_context_ts __SSL_inspection_main_context_t;
 #define SSL_inspection_session_t __SSL_inspection_session_t
@@ -560,6 +562,13 @@ struct SSL_inspection_main_context_ts {
 
 #if !defined(OPENSSL_NO_ENGINE)
 	ENGINE *m_engine;
+#endif
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L && !defined(LIBRESSL_VERSION_NUMBER)
+	size_t         m_provider_count;
+	const char    *m_provider_names[def_SSL_inspection_max_providers];
+	OSSL_PROVIDER *m_providers[def_SSL_inspection_max_providers];
+	OSSL_PROVIDER *m_provider_default;
+	const char    *m_provider_props;
 #endif
 #if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
 	unsigned long m_ssl_options;
