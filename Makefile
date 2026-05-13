@@ -260,8 +260,7 @@ $(MAIN_OBJECTS): CFLAGS_COMMON+=-fPIE
 # common compile
 %$(EXT_OBJECT): ./%$(EXT_C_SOURCE) Makefile
 	@$(ECHO) "[CC] $(notdir $(@)) <= $(notdir $(<))"
-	@$(CC) $(CFLAGS_COMMON) $(CFLAGS) -c -o "$(@)" "$(<)"
-	@$(CC) -MMD $(CFLAGS_COMMON) $(CFLAGS) -c -o "$(@)" "$(<)" # create depend rule file (strong depend check, optional)
+	@$(CC) -MMD -MF "$(@:.o=.d)" $(CFLAGS_COMMON) $(CFLAGS) -c -o "$(@)" "$(<)"
 
 # include depend rules (strong depend check, optional)
 override THIS_DEPEND_RULES_LIST:=$(wildcard *$(EXT_DEPEND))#

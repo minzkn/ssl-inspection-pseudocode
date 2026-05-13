@@ -54,6 +54,7 @@ static void *ec_dup(const void *vkey, int selection)
         if (!dst->pkey) { OPENSSL_free(dst); return NULL; }
     }
     dst->selection = selection;
+    dst->provctx   = src->provctx;
     return dst;
 }
 

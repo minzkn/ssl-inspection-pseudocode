@@ -214,31 +214,6 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 		strlen((const char *)(&cg_test_secret[0]))
 	);
 
-#if 0L
-	(void)hwport_sha256_push(
-		s_sha256,
-		(const char *)(&cg_test_data[0]),
-		strlen((const char *)(&cg_test_data[0]))
-	);
-
-#if 1L /* Test by OpenSSL */
-	if(s_hmac_ctx != ((HMAC_CTX *)(NULL))) {
-		if(HMAC_Update(
-			s_hmac_ctx,
-			(const unsigned char *)(&cg_test_data[0]),
-			strlen((const char *)(&cg_test_data[0]))
-			) <= 0) {
-			(void)SSL_inspection_fprintf(
-				stdout,
-				"* TEST Digest HMAC-SHA-256 push by OpenSSL " def_hwport_color_red "FAILED" def_hwport_color_normal " ! (HMAC_Update failed)\n"
-			);
-
-			HMAC_CTX_free(s_hmac_ctx);
-			s_hmac_ctx = (HMAC_CTX *)NULL;
-		}
-	}
-#endif
-#else /* partial test */
 	do {
 		size_t s_data_size;
 		size_t s_offset;
@@ -248,7 +223,7 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 		srand((unsigned int)time((time_t *)(NULL)));
 		s_data_size = strlen((const char *)(&cg_test_data[0]));
 		for(s_offset = (size_t)0u;s_offset < s_data_size;) {
-			s_rand_size = ((size_t)(rand() % 10)) /* + ((size_t)1u) */;
+			s_rand_size = ((size_t)(rand() % 10)) + (size_t)1u;
 			s_unit_size = s_data_size - s_offset;
 			if(s_unit_size > s_rand_size) {
 				s_unit_size = s_rand_size;
@@ -259,13 +234,12 @@ int SSL_inspection_hmac_sha256_test1(int s_is_verbose)
 				(const char *)(&cg_test_data[s_offset]),
 				s_unit_size
 			);
-			
+
 			s_offset += s_unit_size;
-			
+
 			(void)SSL_inspection_fprintf(stdout, "partial push %lu/%lu/%lu\n", s_unit_size, s_offset, s_data_size);
 		}
 	}while(0);
-#endif
 
 	(void)SSL_inspection_fprintf(
 		stdout,
@@ -523,11 +497,7 @@ int SSL_inspection_evp_test0(int s_is_verbose)
 
 	(void)SSL_inspection_fprintf(stdout, "* TEST AEAD-AES128-GCM\n");
 
-#if 1L
 	c_cipher = EVP_get_cipherbyname("aes-128-gcm");
-#else
-	c_cipher = EVP_aes_128_gcm();
-#endif
 
 	if(s_is_verbose >= 2) {
 		(void)SSL_inspection_fprintf(stdout, "  - TEST-VECTOR:Key (%lu bytes)\n", (unsigned long)sizeof(cg_key0));
@@ -674,11 +644,7 @@ int SSL_inspection_evp_test1(int s_is_verbose)
 
 	(void)SSL_inspection_fprintf(stdout, "* TEST TLSv1.2 record (Cipher-suite is AES128-GCM-SHA256)\n");
 
-#if 1L
 	c_cipher = EVP_get_cipherbyname("aes-128-gcm");
-#else
-	c_cipher = EVP_aes_128_gcm();
-#endif
 
 	(void)memcpy((void *)(&s_salt_iv0[0]), (const void *)(&cg_salt0[0]), sizeof(cg_salt0));
 	(void)memcpy((void *)(&s_salt_iv0[sizeof(cg_salt0)]), (const void *)(&cg_iv0[0]), sizeof(cg_iv0));

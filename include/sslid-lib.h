@@ -535,7 +535,7 @@ struct SSL_inspection_main_context_ts {
 	int m_use_tproxy;             /* --tproxy: transparent proxy (iptables TPROXY rule + policy routing required) */
 	int m_connect_address_explicit; /* -B was given explicitly: enables TPROXY fallback to -B/-P on self-address */
 	int m_use_auto_detect_tls;   /* --auto-detect-tls: 연결별 TLS/TCP 자동 감지 */
-	int m_peek_timeout_ms;       /* --peek-timeout: 서버 선행 프로토콜 폴백 타임아웃 ms (기본 3000) */
+	uint32_t m_peek_timeout_ms;  /* --peek-timeout: 서버 선행 프로토콜 폴백 타임아웃 ms (기본 3000) */
 
 	pid_t m_pid;
 	int m_cpu_count;
@@ -814,23 +814,8 @@ extern int SSL_inspection_set_freebind_socket(int s_socket, int s_is_enable);
 extern int SSL_inspection_set_tx_socket_buffer_size(int s_socket, size_t s_size);
 extern int SSL_inspection_set_rx_socket_buffer_size(int s_socket, size_t s_size);
 
-extern int SSL_inspection_is_readable(int s_socket, int s_timeout_msec);
-extern int SSL_inspection_is_writable(int s_socket, int s_timeout_msec);
-extern void SSL_inspection_wait_for_async(SSL *s_ssl);
-
-extern int SSL_inspection_shutdown(SSL *s_ssl);
-
 extern int SSL_inspection_closefd(int s_fd);
 extern int SSL_inspection_closesocket(int s_socket);
-
-extern ssize_t SSL_inspection_recv(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec);
-extern ssize_t SSL_inspection_send(SSL *s_ssl, int s_socket, const void *s_data, size_t s_size, int s_timeout_msec);
-
-extern ssize_t SSL_inspection_recv_fill(SSL *s_ssl, int s_socket, void *s_data, size_t s_size, int s_timeout_msec);
-extern ssize_t SSL_inspection_send_fill(SSL *s_ssl, int s_socket, const void *s_data, size_t s_size, int s_timeout_msec);
-
-extern SSL *SSL_inspection_ssl_do_handshake(SSL_CTX *s_ssl_ctx, int s_socket, int s_timeout_msec, int s_is_accept);
-extern int SSL_inspection_connect(int s_socket, const void *s_sockaddr_ptr, socklen_t s_socklen, int s_timeout_msec);
 
 extern ssize_t SSL_inspection_encrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_plaintext, size_t s_plaintext_size, const void *s_aad, size_t s_aad_size, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_ciphertext, void *s_tag);
 extern ssize_t SSL_inspection_decrypt_AES_GCM(const EVP_CIPHER *s_cipher, const void *s_ciphertext, size_t s_ciphertext_size, const void *s_aad, size_t s_aad_size, const void *s_tag, const void *s_key, const void *s_iv, size_t s_iv_size, void *s_plaintext);

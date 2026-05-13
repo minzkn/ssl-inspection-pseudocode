@@ -264,7 +264,11 @@ static void *pbkdf2_dupctx(void *vctx)
     if (!dst) return NULL;
     *dst = *src;
     dst->kdf  = NULL;
-    dst->kctx = src->kctx ? EVP_KDF_CTX_dup(src->kctx) : NULL;
+    dst->kctx = NULL;
+    if (src->kctx) {
+        dst->kctx = EVP_KDF_CTX_dup(src->kctx);
+        if (!dst->kctx) { OPENSSL_clear_free(dst, sizeof(*dst)); return NULL; }
+    }
     return dst;
 }
 
@@ -317,10 +321,10 @@ static int pbkdf2_set_ctx_params(void *vctx, const OSSL_PARAM params[])
     size_t            len;
 
     if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_DIGEST)) != NULL) {
-        strncpy(ctx->digest, (char *)p->data,
-                p->data_size < sizeof(ctx->digest)
-                    ? p->data_size : sizeof(ctx->digest) - 1);
-        ctx->digest[sizeof(ctx->digest) - 1] = '\0';
+        len = p->data_size < sizeof(ctx->digest) - 1
+              ? p->data_size : sizeof(ctx->digest) - 1;
+        memcpy(ctx->digest, p->data, len);
+        ctx->digest[len] = '\0';
     }
     if ((p = OSSL_PARAM_locate_const(params, OSSL_KDF_PARAM_PASSWORD)) != NULL) {
         len = p->data_size < sizeof(ctx->pass) ? p->data_size : sizeof(ctx->pass);

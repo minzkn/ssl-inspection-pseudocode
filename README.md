@@ -10,15 +10,17 @@ listen port로 연결이 들어오면 connect 주소로 연결을 맺고 TLS han
 ### 주요 기능
 
 - SSL/TLS proxy (Man-in-the-Middle)
-- SNI(Server Name Indication) 자동 감지: ClientHello를 peek하여 SNI hostname을 추출하고 per-session SSL_CTX 생성
+- SNI(Server Name Indication) 자동 감지: ClientHello를 최대 16 KB peek하여 SNI hostname을 추출하고 per-session SSL_CTX 생성 (TLS 1.3 large extension/key_share 대응)
 - 자동 자체 서명 인증서 생성 (cert/key 파일 미지정 시)
 - **TLS/TCP 자동 감지 모드** (`--auto-detect-tls`): accept 즉시 upstream TCP 연결 + 클라이언트 첫 바이트 peek를 동시에 수행하여 TLS이면 SSL MITM, non-TLS이면 plain TCP relay로 자동 전환
+- **OpenSSL 3.x Provider 지원** (`--provider`, `--provider-props`): QAT, FIPS 등 가속기/보안 모듈 연계를 위한 Provider 로드 및 속성 설정
+- **SO_REUSEPORT 다중 수신** (`--multi-listen`): 모든 worker 가 같은 포트를 공유하여 커널 레벨 SYN 로드 밸런싱 수행
 - AES 암/복호화 독립 구현 (AES-128/192/256, ECB/CFB8/OFB8/CBC/GCM 모드)
 - SHA256 및 HMAC-SHA256 독립 구현
 - TLS v1.2 Pseudo Random Function (PRF) 구현
 - GHASH (GF(2^128) multiplication) 구현
 - epoll 기반 다중 세션 처리
-- Thread pool (worker별 epoll, CPU 수 기본값)
+- Thread pool (worker 별 epoll, CPU 수 기본값, `--thread-pool=<count>` 로 조정 가능)
 - kTLS 커널 레벨 암/복호화 오프로드 (OpenSSL 3.x+, Linux kTLS 지원 커널)
 - splice(2) 기반 zero-copy 중계 (`--splice`, `--ktls` 필요)
 - TPROXY 투명 프록시 모드 (`--tproxy`)
@@ -37,7 +39,7 @@ ssl-inspection-pseudocode/
 ├── sha256.c             # SHA256, HMAC-SHA256, TLSv1.2 PRF 구현
 ├── ghash.c              # GHASH (GF(2^128)) 구현
 ├── test-vector.c        # 암호화 테스트 벡터
-├── signal-handler.c     # 시그널 핸들러
+├── signal-handler.c     # 시그널 핸들러 (async-signal-safe, sig_atomic_t 기반)
 ├── include/
 │   └── sslid-lib.h      # 공통 헤더 및 구조체 정의
 ├── misc/                # 참고 자료 (OpenSSL cnf, TLS 패킷 캡처 등)
@@ -165,6 +167,9 @@ sudo ./sslid --tproxy -p 8443 -B 1.0.0.1 -P 443 -v
 # --splice 는 --ktls 를 자동으로 활성화합니다
 ```
 
+> 한쪽 FIN 수신 시 반대 방향 파이프에 잔류 데이터가 있으면 POLLOUT 으로 단기 재시도
+> (~20ms)하여 잔여 바이트 유실을 최소화합니다.
+
 ## 옵션 전체 목록
 
 ```
@@ -180,13 +185,14 @@ sudo ./sslid --tproxy -p 8443 -B 1.0.0.1 -P 443 -v
 -c, --cert=<filename>       CA 인증서 파일 (미지정 시 자동 생성)
 -k, --key=<filename>        CA 키 파일 (미지정 시 자동 생성)
 -B, --connect=<address>     연결 대상 주소 (기본: 1.0.0.1)
-                            --tproxy 와 함께 사용 시 self-address fallback 활성화
+                            --tproxy 와 함께 사용 시 자기 주소 감지 후 -B/-P 로 자동 fallback
 -P, --connect-port=<port>   연결 대상 포트 (기본: 443)
     --buffer-size=<bytes>   레코드 버퍼 크기 (기본: 16384, TLS 최대 레코드 크기)
 -n, --no-thread             단일 worker 모드 (스레드 없음)
-    --thread-pool=<count>   Worker 스레드 수 (기본: CPU 개수, 최대: 4096)
+    --thread-pool=<count>   Worker 스레드 수 (기본: CPU 개수, 범위: 1-4096)
     --serialize-lock        SSL handshake 직렬화 잠금 사용
--a, --async                 OpenSSL ASYNC 모드 사용
+-a, --async                 OpenSSL ASYNC 모드 사용 (QAT 등 HW 가속기 Provider 연동 시
+                            OSSL_ASYNC_FD를 epoll에 등록하여 HW 완료 이벤트를 비동기 대기)
     --nossl                 TCP proxy 모드 (SSL passthrough, TLS 처리 없음)
     --ktls                  kTLS 활성화: 커널 레벨 암/복호화 오프로드 (OpenSSL 3.x+)
     --splice                splice(2) zero-copy 중계 (--ktls 자동 활성화, OpenSSL 3.x+)
@@ -198,7 +204,11 @@ sudo ./sslid --tproxy -p 8443 -B 1.0.0.1 -P 443 -v
                             --nossl 과 함께 사용 불가.
     --peek-timeout=<ms>     --auto-detect-tls 사용 시 클라이언트 데이터 대기 최대 시간
                             (기본: 3000ms, 최대: 3600000ms).
-                            타임아웃 시 TCP relay로 전환 (서버 선행 프로토콜 대응).
+                            타임아웃 시 TCP relay 로 전환 (서버 선행 프로토콜 대응).
+    --provider=<name>       OpenSSL 3.x Provider 로드 (반복 사용 가능,
+                            예: --provider default --provider qatprovider)
+                            "default" 는 SW 폴백으로 항상 로드됨
+    --provider-props=<str>  EVP 속성 쿼리 문자열 (예: "?provider=qatprovider")
 ```
 
 ## 요구사항

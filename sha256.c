@@ -254,7 +254,7 @@ void *hwport_sha256_digest(hwport_sha256_t *s_sha256, void *s_digest)
         
     /* get digest */
     for(s_count = (size_t)0u;s_count < ((size_t)def_hwport_sha256_hash_words);s_count++) {
-		*((uint32_t *)(((uint8_t *)s_digest) + (s_count * sizeof(uint32_t)))) = be32toh(s_sha256->m_hash[s_count]);
+		*((uint32_t *)(((uint8_t *)s_digest) + (s_count * sizeof(uint32_t)))) = htobe32(s_sha256->m_hash[s_count]);
     }
 
     return(s_digest);
@@ -391,7 +391,6 @@ void *hwport_pseudo_random_function_tlsv1_2_sha256(const void *s_secret, size_t 
 			client write IV
 			server write IV
 	*/
-#if 1L /* by my implementation */
 	hwport_sha256_t s_sha256_local;
 	hwport_sha256_t *s_sha256;
 
@@ -439,100 +438,6 @@ void *hwport_pseudo_random_function_tlsv1_2_sha256(const void *s_secret, size_t 
 	SSL_inspection_secure_memzero((void *)(&s_digest_local_P[0]), sizeof(s_digest_local_P));
 	SSL_inspection_secure_memzero((void *)(&s_digest_local_A[0]), sizeof(s_digest_local_A));
 	SSL_inspection_secure_memzero((void *)(&s_sha256_local), sizeof(s_sha256_local));
-#else /* by OpenSSL */
-	HMAC_CTX *s_hmac_ctx;
-	const EVP_MD *c_evp_md;
-
-	uint8_t s_digest_local_A[ def_hwport_sha256_digest_size ];
-	uint8_t s_digest_local_P[ def_hwport_sha256_digest_size ];
-
-	size_t s_offset;
-	size_t s_copy_size;
-
-	s_hmac_ctx = HMAC_CTX_new();
-	c_evp_md = EVP_sha256(); /* == EVP_get_digestbyname("sha256") */
-
-	(void)HMAC_Init_ex(
-		s_hmac_ctx,
-		(const void *)s_secret,
-		(int)s_secret_size,
-		c_evp_md,
-		(ENGINE *)NULL);
-	(void)HMAC_Update(
-		s_hmac_ctx,
-		(const unsigned char *)s_label,
-		s_label_size
-		);
-	(void)HMAC_Update(
-		s_hmac_ctx,
-		(const unsigned char *)s_seed,
-		s_seed_size
-		);
-	(void)HMAC_Final(
-		s_hmac_ctx,
-		(unsigned char *)(&s_digest_local_A[0]),
-		(unsigned int *)NULL
-		);
-	
-	for(s_offset = (size_t)0u;s_offset < s_output_size;) {
-		(void)HMAC_Init_ex(
-			s_hmac_ctx,
-			(const void *)s_secret,
-			(int)s_secret_size,
-			c_evp_md,
-			(ENGINE *)NULL);
-		(void)HMAC_Update(
-			s_hmac_ctx,
-			(const unsigned char *)(&s_digest_local_A),
-			sizeof(s_digest_local_A)
-			);
-		(void)HMAC_Update(
-			s_hmac_ctx,
-			(const unsigned char *)s_label,
-			s_label_size
-			);
-		(void)HMAC_Update(
-			s_hmac_ctx,
-			(const unsigned char *)s_seed,
-			s_seed_size
-			);
-		(void)HMAC_Final(
-			s_hmac_ctx,
-			(unsigned char *)(&s_digest_local_P[0]),
-			(unsigned int *)NULL
-			);
-
-		s_copy_size = s_output_size - s_offset;
-		if(s_copy_size > sizeof(s_digest_local_P)) {
-			s_copy_size = sizeof(s_digest_local_P);
-		}
-		(void)memcpy((void *)(((uint8_t *)s_output) + s_offset), (const void *)(&s_digest_local_P[0]), s_copy_size);
-		s_offset += s_copy_size;
-	
-		(void)HMAC_Init_ex(
-			s_hmac_ctx,
-			(const void *)s_secret,
-			(int)s_secret_size,
-			c_evp_md,
-			(ENGINE *)NULL);
-		(void)HMAC_Update(
-			s_hmac_ctx,
-			(const unsigned char *)(&s_digest_local_A),
-			sizeof(s_digest_local_A)
-			);
-		(void)HMAC_Final(
-			s_hmac_ctx,
-			(unsigned char *)(&s_digest_local_A[0]),
-			(unsigned int *)NULL
-			);
-	}
-
-	/* memwipe */
-	(void)memset((void *)(&s_digest_local_P[0]), 0, sizeof(s_digest_local_P));
-	(void)memset((void *)(&s_digest_local_A[0]), 0, sizeof(s_digest_local_A));
-
-	HMAC_CTX_free(s_hmac_ctx);
-#endif
 
 	return(s_output);
 }

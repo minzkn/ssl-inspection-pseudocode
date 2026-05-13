@@ -29,19 +29,19 @@ int SSL_inspection_install_signal_handler(void);
 
 /* ---- */
 
-static volatile int g_SSL_inspection_break = 0;
-static volatile int g_SSL_inspection_critical = 0;
+static volatile sig_atomic_t g_SSL_inspection_break = 0;
+static volatile sig_atomic_t g_SSL_inspection_critical = 0;
 
 /* ---- */
 
 void SSL_inspection_break_main_loop(void)
 {
-	*((volatile int *)(&g_SSL_inspection_break)) = 1;
+	g_SSL_inspection_break = 1;
 }
 
 int SSL_inspection_is_break_main_loop(void)
 {
-	return(*((volatile int *)(&g_SSL_inspection_break)));
+	return((int)g_SSL_inspection_break);
 }
 
 /*
@@ -85,10 +85,10 @@ static void SSL_inspection_signal_handler(int s_signo)
 #endif
 		case SIGABRT:
 			{ ssize_t s_wr_ = write(STDERR_FILENO, cg_signal_msg, sizeof(cg_signal_msg) - 1); (void)s_wr_; }
-			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
+			if(g_SSL_inspection_critical != 0) {
 				_exit(128 | s_signo);
 			}
-			*((volatile int *)(&g_SSL_inspection_critical)) = 1;
+			g_SSL_inspection_critical = 1;
 			SSL_inspection_signal_safe_backtrace();
 			SSL_inspection_break_main_loop();
 			_exit(128 | s_signo);
@@ -97,7 +97,7 @@ static void SSL_inspection_signal_handler(int s_signo)
 		case SIGINT: /* Ctrl + C */
 		case SIGTERM:
 			{ ssize_t s_wr_ = write(STDERR_FILENO, cg_quit_msg, sizeof(cg_quit_msg) - 1); (void)s_wr_; }
-			if((*((volatile int *)(&g_SSL_inspection_critical))) != 0) {
+			if(g_SSL_inspection_critical != 0) {
 				_exit(128 | s_signo);
 			}
 			if((s_signo == SIGQUIT) || (SSL_inspection_is_break_main_loop() != 0)) {

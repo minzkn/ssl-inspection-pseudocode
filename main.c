@@ -9,6 +9,7 @@
 
 #include "sslid-lib.h"
 
+#include <execinfo.h>
 #include <getopt.h>
 #include <unistd.h>
 
@@ -628,7 +629,7 @@ static int SSL_inspection_sni_is_loopback(const char *s_sni)
 
 static int SSL_inspection_session_peek_sni(SSL_inspection_session_t *s_session)
 {
-	unsigned char s_buf[4096]; /* TLS 1.3 ClientHello는 GREASE/key_share 포함 시 1 KB 초과 가능 */
+	unsigned char s_buf[16384]; /* TLS record payload 최대 크기 (RFC 5246) — oversized ClientHello 대응 */
 	ssize_t s_n;
 	size_t s_pos, s_ext_end, s_type, s_len;
 
@@ -3814,7 +3815,8 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 		}
 		else if(s_n == (ssize_t)0) {
 			/* accept side FIN: fwd_pipe(client→server)는 비어 있지만(진입 조건),
-			 * bwd_pipe(server→client)에 남아 있는 데이터는 클라이언트에 전달하고 종료. */
+			 * bwd_pipe(server→client)에 남아 있는 데이터는 클라이언트에 전달하고 종료.
+			 * EAGAIN 시 POLLOUT로 단기 재시도하여 잔여 데이터 유실을 최소화한다. */
 			while(s_session->m_bwd_pipe_pending > (size_t)0u) {
 				ssize_t s_drained = splice(
 					s_session->m_bwd_splice_pipe[0], (loff_t *)(NULL),
@@ -3825,8 +3827,15 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 				if(s_drained > (ssize_t)0) {
 					s_session->m_bwd_pipe_pending -= (size_t)s_drained;
 				}
+				else if((s_drained < (ssize_t)0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+					struct pollfd s_pfd;
+					s_pfd.fd      = s_session->m_accept_socket;
+					s_pfd.events  = POLLOUT;
+					s_pfd.revents = 0;
+					if(poll(&s_pfd, (nfds_t)1, 20) <= 0) break; /* 20ms 내 수신 불가 시 best-effort 포기 */
+				}
 				else {
-					break; /* EAGAIN 또는 에러 — best-effort drain */
+					break; /* 에러 또는 FIN */
 				}
 			}
 			return(-1);
@@ -3876,7 +3885,8 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 		}
 		else if(s_n == (ssize_t)0) {
 			/* connect side FIN: bwd_pipe(server→client)는 비어 있지만(진입 조건),
-			 * fwd_pipe(client→server)에 남아 있는 데이터는 서버에 전달하고 종료. */
+			 * fwd_pipe(client→server)에 남아 있는 데이터는 서버에 전달하고 종료.
+			 * EAGAIN 시 POLLOUT로 단기 재시도하여 잔여 데이터 유실을 최소화한다. */
 			while(s_session->m_fwd_pipe_pending > (size_t)0u) {
 				ssize_t s_drained = splice(
 					s_session->m_fwd_splice_pipe[0], (loff_t *)(NULL),
@@ -3887,8 +3897,15 @@ int SSL_inspection_session_splice_relay(SSL_inspection_session_t *s_session)
 				if(s_drained > (ssize_t)0) {
 					s_session->m_fwd_pipe_pending -= (size_t)s_drained;
 				}
+				else if((s_drained < (ssize_t)0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK))) {
+					struct pollfd s_pfd;
+					s_pfd.fd      = s_session->m_connect_socket;
+					s_pfd.events  = POLLOUT;
+					s_pfd.revents = 0;
+					if(poll(&s_pfd, (nfds_t)1, 20) <= 0) break; /* 20ms 내 수신 불가 시 best-effort 포기 */
+				}
 				else {
-					break;
+					break; /* 에러 또는 FIN */
 				}
 			}
 			return(-1);
@@ -5262,6 +5279,13 @@ int main(int s_argc, char **s_argv)
 		(void)pthread_condattr_destroy(&s_condattr);
 	}while(0);
 
+	/* Warmup backtrace() to force libgcc_s.so load before signal handler installation.
+	 * glibc backtrace() lazily dlopen()s libgcc_s.so on first call — dlopen() is not
+	 * async-signal-safe, so calling backtrace() for the first time inside a signal
+	 * handler (e.g. on SIGSEGV) can deadlock.  One dummy call here forces the load
+	 * while we are still in normal context. */
+	{ void *s_bt[1]; (void)backtrace(s_bt, 1); }
+
 	/* setup signal handler */
 	(void)SSL_inspection_install_signal_handler();
 
@@ -5388,7 +5412,7 @@ int main(int s_argc, char **s_argv)
 							s_main_context->m_is_help = 1;
 						}
 						else {
-							s_main_context->m_peek_timeout_ms = (int)s_value;
+							s_main_context->m_peek_timeout_ms = (uint32_t)s_value;
 						}
 					}
 					else if(strcmp(sg_options[s_option_index].name, "provider") == 0) {
